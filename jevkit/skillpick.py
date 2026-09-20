@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from . import client, privacy
+from . import client, privacy, route
 
 MAX_SKILLS = 400
 BATCH = 120
@@ -91,7 +91,14 @@ def looks_trivial(turn: str) -> bool:
 def pick(
     turn: str, skills: List[Dict[str, str]], *, top_k: int = 3, need_threshold: float = 0.5,
     match_threshold: float = 0.5, timeout: float = 5.0, transport: Optional[client.Transport] = None,
+    profile: Optional[str] = None, config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    config = config if config is not None else route.load_config()
+    home = route.catalog_mod.hermes_home()
+    profile = profile if profile is not None else (home.name if home.parent.name == "profiles" else "default")
+    if profile in (config.get("private_profiles") or []):
+        return {"status": "fail_open", "reason": "private profile; not sent",
+                "skipped": "private_profile", "skills": [], "latency_ms": 0}
     if looks_trivial(turn):
         return {"status": "ok", "needs_skill": 0.0, "skills": [], "latency_ms": 0, "skipped": "trivial"}
     if not skills or privacy.is_sensitive(turn):

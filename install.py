@@ -134,8 +134,10 @@ def enable_plugins(config: Path, names: Sequence[str], enable: bool) -> Dict[str
     return status
 
 
-def install_hermes(root: Path, enable: str, check: bool) -> Dict[str, object]:
-    homes = hermes_homes(root)
+def install_hermes(root: Path, enable: str, check: bool, *, scoped: bool = False,
+                   plugins: Sequence[str] = PLUGINS, skills: Sequence[str] = SKILLS,
+                   scripts: Sequence[str] = SCRIPTS) -> Dict[str, object]:
+    homes = [root] if scoped else hermes_homes(root)
     if enable == "all":
         wanted = {"default"} | {h.name for h in homes[1:]}
     elif enable == "none":
@@ -145,33 +147,35 @@ def install_hermes(root: Path, enable: str, check: bool) -> Dict[str, object]:
     report: Dict[str, object] = {
         "home": str(root),
         "profiles": len(homes) - 1,
-        "plugins": {name: str(root / "plugins" / name) for name in PLUGINS},
-        "scripts": [str(root / "scripts" / name) for name in SCRIPTS],
+        "plugins": {name: str(root / "plugins" / name) for name in plugins},
+        "scripts": [str(root / "scripts" / name) for name in scripts],
+        "skills": list(skills),
         "enabled_in": {},
     }
     if check:
         report["would_enable_in"] = sorted(wanted)
         return report
-    for name in PLUGINS:
+    for name in plugins:
         plugin_dir = root / "plugins" / name
         _copytree(PLUGIN_SOURCE / name, plugin_dir)
         # A copy of jevkit per plugin, because a plugin can be loaded alone: nightly-handoff.py
         # puts only the hermes-handoff directory on sys.path and imports jevkit from there.
         _copytree(REPO / "jevkit", plugin_dir / "jevkit")
     skills_dir = root / "skills" / "jev"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    for name in SKILLS:
+    if skills:
+        skills_dir.mkdir(parents=True, exist_ok=True)
+    for name in skills:
         _copytree(REPO / "skills" / name, skills_dir / name)
-    for name in SCRIPTS:
+    for name in scripts:
         _copyfile(SCRIPT_SOURCE / name, root / "scripts" / name)
     for home in homes[1:]:
-        for name in PLUGINS:
+        for name in plugins:
             _link(root / "plugins" / name, home / "plugins" / name)   # every lane scans its OWN plugins folder
         _link(skills_dir, home / "skills" / "jev")
     for home in homes:
         label = "default" if home == root else home.name
         if label in wanted and (home / "config.yaml").is_file():
-            report["enabled_in"][label] = enable_plugins(home / "config.yaml", PLUGINS, True)  # type: ignore[index]
+            report["enabled_in"][label] = enable_plugins(home / "config.yaml", plugins, True)  # type: ignore[index]
     return report
 
 
@@ -261,7 +265,53 @@ def main() -> int:
                         help="Hermes root (default: $HERMES_HOME, else ~/.hermes)")
     parser.add_argument("--enable", default="all", help="Hermes profiles to enable the plugins in: all, none, or a,b,c")
     parser.add_argument("--skills-dir", action="append", default=[], help="extra skill folder to install into")
+    parser.add_argument("--hermes-only", action="store_true",
+                        help="Target exactly --hermes-home; no profile discovery, other agents, or CLI link")
+    parser.add_argument("--plugins", default=None, help="Comma-separated plugins (hermes-only scope)")
+    parser.add_argument("--skills", default=None, help="Comma-separated skills or none (hermes-only scope)")
+    parser.add_argument("--scripts", default=None, help="Comma-separated scripts or none (hermes-only scope)")
     args = parser.parse_args()
+    if args.hermes_only:
+        if not args.hermes_home or args.skills_dir or args.enable not in ("all", "none"):
+            parser.error("--hermes-only requires --hermes-home, no --skills-dir, and --enable all|none")
+        def selected(raw, available):
+            values = list(available) if raw is None else ([] if raw == "none" else raw.split(","))
+            if any(value not in available for value in values):
+                parser.error("unknown selection: " + str(raw))
+            return list(dict.fromkeys(values))
+        plugins = selected(args.plugins, PLUGINS)
+        skills = selected(args.skills, SKILLS)
+        scripts = selected(args.scripts, SCRIPTS)
+        requested = Path(args.hermes_home).expanduser().absolute()
+        if requested.is_symlink():
+            parser.error("target Hermes home must not be a symlink")
+        root = requested.resolve()
+        if not (root / "config.yaml").is_file():
+            parser.error("target Hermes home must contain config.yaml")
+        # Refuse links at every writable ancestor: a profile's shared skills link must
+        # never turn a scoped operation into an edit of the fleet's installation.
+        paths = ([root / "plugins" / n for n in plugins]
+                 + [root / "skills" / "jev" / n for n in skills]
+                 + [root / "scripts" / n for n in scripts] + [root / "config.yaml"])
+        for path in paths:
+            if any(part.is_symlink() for part in [path, *path.parents]):
+                parser.error("scoped targets must not traverse symlinks")
+        report = {"mode": "check" if args.check else "uninstall" if args.uninstall else "install",
+                  "scope": "hermes-only", "home": str(root), "plugins": plugins,
+                  "skills": skills, "scripts": scripts, "enable": args.enable,
+                  "uninstall": args.uninstall, "cli": False, "other_agents": False}
+        if args.uninstall:
+            report["targets"] = [str(path) for path in paths if path.name != "config.yaml"]
+            if not args.check:
+                enable_plugins(root / "config.yaml", plugins, False)
+                report["removed"] = [str(path) for path in paths if path.name != "config.yaml" and _remove(path)]
+        else:
+            report["hermes"] = install_hermes(root, args.enable, args.check, scoped=True,
+                                              plugins=plugins, skills=skills, scripts=scripts)
+        print(json.dumps(report, indent=2))
+        return 0
+    if any(value is not None for value in (args.plugins, args.skills, args.scripts)):
+        parser.error("--plugins/--skills/--scripts require --hermes-only")
 
     home = Path.home()
     hermes = Path(args.hermes_home).expanduser() if args.hermes_home else Path(

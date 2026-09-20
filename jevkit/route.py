@@ -300,7 +300,8 @@ def decide(
     # A recurring job repeats its instruction verbatim, so buy the decision once and reuse it.
     cache_key = None
     if config.get("cache_repeat_asks", True):
-        cache_key = _cache_key(ask, profile, only_provider, has_images, bool(pinned))
+        cache_material = json.dumps([ask, config, current, context_tokens], sort_keys=True)
+        cache_key = _cache_key(cache_material, profile, only_provider, has_images, bool(pinned))
         cached = _DECISIONS.get(cache_key)
         if cached is not None:
             return {**cached, "cached": True}
