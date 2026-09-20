@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.1 (2026-09-19)
+
+Documentation only. No behaviour changes.
+
+- **The README now shows the product instead of describing it.** The first screen answers
+  what Jev is, what it decides, what it costs, and what leaves your machine, with a
+  screenshot of the model routing dashboard (`docs/images/model-routing-dashboard.png`)
+  taken from example data, so no real profile name, customer or path is published.
+- **The tool list was two tools out of date.** It named three of the five the plugin
+  registers; `jev_supervise` and `jev_escalate` were missing.
+- Added a two-command quickstart and a "start in shadow mode" path, because the honest way
+  to evaluate routing is to watch it decide before it switches anything.
+
 ## 0.13.0 (2026-09-19)
 
 A hardening pass: five reviewers were each told to break one area, and everything below is

@@ -1,8 +1,16 @@
 # Hermes Jev Skills
 
-Give your agent a fast, cheap second brain for the small decisions.
+**Give your agent a fast, cheap second brain for the small decisions.**
 
-[Jev](https://docs.typesafe.ai) is TypeSafe's decision model. It does not write text. You hand it a state and typed questions (pick one, score this, yes or no) and it answers in about 0.4 seconds for a tiny fraction of a cent, with a calibrated confidence. This repo puts that to work on the decisions an agent makes all day, so your expensive model only does the thinking and writing.
+Your agent burns frontier-model tokens on things that are not thinking: which model should answer this turn, which of 377 skills to load, which retrieved passages matter, which turns survive a summary, which button comes next. Those are decisions, not prose. Hand them to something that costs a fraction of a cent and answers in about 0.4 seconds, and let the expensive model do the writing.
+
+That is what [Jev](https://docs.typesafe.ai) is. It is TypeSafe's decision model. **It never writes text.** You give it a state and typed questions (pick one, score this, yes or no) and it answers with a calibrated confidence. This repo wires that into an agent's day.
+
+![The model routing dashboard: the Jev on/shadow/off switch, the routing pools grid, and live decisions as they happen](docs/images/model-routing-dashboard.png)
+
+*`jev dashboard` with example data: one switch for Jev routing, every pool as a tier-by-work-kind grid, and each decision as it happens (tier, work kind, model, which pool it came from, confidence, latency).*
+
+## What Jev decides, and what it costs
 
 | Skill | What Jev decides | Measured |
 |---|---|---|
@@ -14,43 +22,25 @@ Give your agent a fast, cheap second brain for the small decisions.
 | **Computer use** | The next GUI action, from a table of actions you already judged safe. `--plan` splits a multi-step command once, up front | ~0.5 s per decision |
 | **Browser use** | The next page action, same contract | ~0.4 s per step |
 
-Plus a **model routing dashboard** (`jev dashboard`): every profile's models on one page, an on/shadow/off switch for Jev routing, and a live view of where each turn is being sent. See [router-dashboard](router-dashboard/README.md).
+Eight skills ship as plain `SKILL.md` files, so they are not Hermes-only. The same folder works in Claude Code, Codex, or anything that reads a skill file.
 
-Built for [Hermes](https://github.com/NousResearch/hermes-agent). The skills and the `jev` command also work in Claude Code, Codex and anything else that reads `SKILL.md` files.
-
-## Install
-
-**Point your agent at this repo** and say: *"Install Hermes Jev Skills from https://github.com/kerpopule/hermes-jev-skills"*. It will follow [AGENTS.md](AGENTS.md).
-
-**Got it as a zip?** Unzip it anywhere, then run the second and third commands below from that folder.
-
-Or by hand (Python 3.9+, no dependencies):
+## Try it in two commands
 
 ```bash
-git clone https://github.com/kerpopule/hermes-jev-skills ~/hermes-jev-skills
+git clone https://github.com/kerpopule/hermes-jev-skills ~/hermes-jev-skills && python3 ~/hermes-jev-skills/install.py
 ```
 
 ```bash
-python3 ~/hermes-jev-skills/install.py
+jev setup-key   # paste your key into the one-time page it opens, then run: jev doctor
 ```
 
-```bash
-jev setup-key
-```
+The installer finds Hermes, Claude Code and Codex on the machine and installs for each one it finds. `python3 install.py --check` shows exactly what it would do without changing anything. `--uninstall` reverses it.
 
-The installer finds Hermes, Claude Code and Codex on the machine and installs for each one it finds. `python3 install.py --check` shows what it would do without changing anything; `--uninstall` reverses it.
-
-## Your API key never touches the agent
-
-`jev setup-key` opens a one-time page served only by your own computer. You paste your [TypeSafe key](https://console.typesafe.ai/settings/keys) there. It goes straight into the OS secret store (macOS Keychain, or `secret-tool` on Linux, or a 0600 file as a last resort) and, on a Hermes machine, into each profile's `.env`. The agent that ran the command sees one line: stored, verified, yes or no. Never the key, not even a prefix.
-
-The page lives on an unguessable one-time URL, refuses requests with a foreign `Host` header (DNS rebinding), sends no referrer, logs nothing, and shuts down after one use or ten minutes. On a headless box, run `jev setup-key --tty` yourself for a hidden prompt.
-
-**Do not paste your key into a chat.** If you already did, make a new one.
+**Not sure yet?** Run `jev models suggest --write` to draft routing pools from price bands, then `/jev routing shadow` for a day. Shadow mode decides and logs without switching anything, so a day of decisions costs almost nothing and risks nothing. Turn it on when the log looks right.
 
 ## On Hermes
 
-The `hermes-jev` plugin uses only public plugin seams (`pre_llm_call`, `llm_request` middleware, tools, a slash command), so `hermes update` does not break it and nothing in Hermes core is patched.
+Start in shadow mode. It is the honest way to see what Jev would do before it does anything.
 
 ```
 /jev                         status
@@ -61,7 +51,9 @@ The `hermes-jev` plugin uses only public plugin seams (`pre_llm_call`, `llm_requ
 /jev routing on all          make it the default for every profile (a profile's own setting still wins)
 ```
 
-Tools the agent gets: `jev_memory_filter`, `jev_compact_select`, `jev_choose_action`.
+The agent gets five tools: `jev_memory_filter`, `jev_compact_select`, `jev_choose_action`, `jev_supervise`, `jev_escalate`.
+
+The `hermes-jev` plugin uses only public plugin seams (`pre_llm_call`, the `llm_request` middleware, tools, a slash command), so `hermes update` does not break it and nothing in Hermes core is patched.
 
 A plugin can swap the model, not the provider connection. On OpenRouter that still covers every vendor. If you run `/model` yourself, your choice wins.
 
@@ -73,11 +65,19 @@ jev models providers         # which providers you hold a key or login for
 jev models suggest --write   # first-draft pools from price bands; then edit to taste
 ```
 
-The catalog is [models.dev](https://models.dev), filtered to providers whose API-key name is set in your environment or Hermes `.env`, or that Hermes holds a login for. Only key *names* are read. Pools live in `~/.hermes/jev/routing.json` (the default for every profile); `~/.hermes/profiles/<name>/jev/routing.json` overrides it for one profile. See [skills/jev-model-routing](skills/jev-model-routing/SKILL.md).
+The catalog is [models.dev](https://models.dev), filtered to providers whose API-key name is set in your environment or Hermes `.env`, or that Hermes holds a login for. Only key *names* are read. Pools live in `~/.hermes/jev/routing.json` (the default for every profile); `~/.hermes/profiles/<name>/jev/routing.json` overrides it for one profile. Details in [skills/jev-model-routing](skills/jev-model-routing/SKILL.md).
+
+## Your API key never touches the agent
+
+`jev setup-key` opens a one-time page served only by your own computer. You paste your [TypeSafe key](https://console.typesafe.ai/settings/keys) there. It goes straight into the OS secret store (macOS Keychain, or `secret-tool` on Linux, or a 0600 file as a last resort) and, on a Hermes machine, into each profile's `.env`. The agent that ran the command sees one line: stored, verified, yes or no. Never the key, not even a prefix.
+
+The page lives on an unguessable one-time URL, refuses requests with a foreign `Host` header (DNS rebinding), sends no referrer, logs nothing, and shuts down after one use or ten minutes. On a headless box, run `jev setup-key --tty` yourself for a hidden prompt.
+
+**Do not paste your key into a chat.** If you already did, make a new one.
 
 ## What leaves your machine
 
-Jev is a cloud API, so this is spelled out:
+Jev is a cloud API, so this is spelled out rather than implied:
 
 - **Routing**: the user's turn, redacted (emails, phones, tokens, long hex masked), capped at 3,000 characters. Never history, tool results, files or memory. Turns that look like they hold a secret, and any profile you list in `private_profiles`, send only coarse features: length, whether code is present, whether risk words appear.
 - **Memory**: the query and up to 900 characters per passage, redacted. Your store's ids, paths and sources are replaced with `P0`, `P1`… and never sent. A passage that looks like a credential is not sent at all.
@@ -91,18 +91,23 @@ Logs hold decisions only (tier, model, confidence, latency). Never prompt text.
 
 No key, timeout, rate limit, malformed reply, low confidence: routing keeps your current model, memory returns the original list, compaction drops nothing, skill selection suggests nothing, and computer use returns `reobserve`. A Jev outage costs you at most the time budget (2.5 s for routing) and never blocks a turn.
 
-Safety rails that do not depend on Jev being right: risk words (production, delete, migration, security, payment, legal…) never route to the cheapest tier; a large context never switches to a cheaper model mid-session; a transcript turn is only dropped on a confident answer; Jev can only ever return an action id you put in the table.
+Safety rails that do not depend on Jev being right:
+
+- Risk words (production, delete, migration, security, payment, legal…) never route to the cheapest tier.
+- A large context never switches to a cheaper model mid-session.
+- A transcript turn is only dropped on a confident answer.
+- Jev can only ever return an action id you put in the table.
 
 ## Layout
 
 ```
-jevkit/          the library and the `jev` command (stdlib only)
-skills/          eight SKILL.md skills, agent-agnostic
-hermes/plugin/   the Hermes plugin
+jevkit/            the library and the `jev` command (stdlib only)
+skills/            eight SKILL.md skills, agent-agnostic
+hermes/plugin/     the Hermes plugin
 router-dashboard/  the model routing page (`jev dashboard`)
-install.py       installer / uninstaller
-tests/           offline tests, every Jev reply faked
-docs/            integration notes and hard-won operational lessons
+install.py         installer / uninstaller
+tests/             offline tests, every Jev reply faked
+docs/              integration notes and hard-won operational lessons
 ```
 
 | Doc | Read it when |
@@ -112,10 +117,12 @@ docs/            integration notes and hard-won operational lessons
 | [wiring-triage-into-a-live-pipeline.md](docs/wiring-triage-into-a-live-pipeline.md) | Adding classification to something already carrying real traffic. |
 | [hermes-compaction.md](docs/hermes-compaction.md) | Compaction and handoff on Hermes specifically. |
 
+The tests are offline and every Jev reply is faked, so they are safe to run anywhere:
+
 ```bash
 python3 -m unittest discover -s tests
 ```
 
 ## License
 
-MIT. Jev and TypeSafe are products of TypeSafe AI; this project is independent. Optional browser runner wraps [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast) (MIT), which is not bundled.
+MIT. Jev and TypeSafe are products of TypeSafe AI; this project is independent. The optional browser runner wraps [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast) (MIT), which is not bundled.
