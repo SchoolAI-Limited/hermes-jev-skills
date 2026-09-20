@@ -137,6 +137,8 @@ def _on_llm_request(request: Optional[Dict[str, Any]] = None, session_id: str = 
     if not turn or turn["turn_id"] != turn_id:
         return None
     decision = turn["decision"]
+    if provider == "openai-codex" and mode != "shadow":
+        decision = None  # never reuse a shadow candidate after switching to active mode
     if decision is None:                       # first API call of this turn: ask Jev exactly once
         catalog_provider = catalog.HERMES_ALIASES.get(provider, provider)
         # Some Hermes paths hand us an already-prefixed model id; normalising here keeps
@@ -148,9 +150,11 @@ def _on_llm_request(request: Optional[Dict[str, Any]] = None, session_id: str = 
         messages = request.get("messages") or request.get("input") or []
         decision = route.decide(
             turn["text"], current=current, profile=_profile(), only_provider=catalog_provider,
-            config=_routing_config(),
-            context_tokens=len(json.dumps(messages, default=str)) // 4,
-            has_images="image_url" in json.dumps(messages[-1:], default=str),
+            config=_routing_config(), shadow=mode == "shadow",
+            need_tools=bool(request.get("tools")),
+            context_tokens=len(json.dumps(request if provider == "openai-codex" else messages, default=str)) // 4,
+            has_images=(any(marker in json.dumps(messages, default=str) for marker in ("image_url", "input_image"))
+                        if provider == "openai-codex" else "image_url" in json.dumps(messages[-1:], default=str)),
             pinned=bool(default_bare) and bare != default_bare)   # you ran /model: your choice wins
         turn["decision"] = decision
         _log({"kind": "route", "mode": mode, "session_id": session_id, "turn_id": turn_id, "from": current, **{k: decision.get(k) for k in (
@@ -159,7 +163,7 @@ def _on_llm_request(request: Optional[Dict[str, Any]] = None, session_id: str = 
             # "is the specialty answer earning its keep?" cannot be answered from the log.
             "routed", "model", "tier", "specialty", "has_images", "confidence", "difficulty",
             "costly_mistake", "private", "reason", "latency_ms", "policy", "cached")}})
-    if mode != "on" or not decision.get("routed") or not decision.get("model_id"):
+    if provider == "openai-codex" or mode != "on" or not decision.get("routed") or not decision.get("model_id"):
         return None
     return {"request": {**request, "model": decision["model_id"]}}
 

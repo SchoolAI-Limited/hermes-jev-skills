@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+from datetime import datetime
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -19,9 +21,52 @@ CACHE_TTL = 24 * 3600
 
 # Hermes login names → models.dev provider ids, where they differ.
 HERMES_ALIASES = {
-    "xai-oauth": "xai", "gemini": "google", "kimi-coding": "kimi-for-coding", "openai-codex": "openai",
+    "xai-oauth": "xai", "gemini": "google", "kimi-coding": "kimi-for-coding",
     "zai": "zai", "copilot": "github-copilot", "minimax": "minimax", "moonshot": "moonshotai",
 }
+
+
+def codex_shadow_models(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Validate operator-supplied account evidence only; never discover or enrich it.
+
+    Missing capabilities remain unknown. Any malformed entry invalidates the inventory.
+    Provenance is a local label, not a URL to fetch or evidence of a fresh login.
+    """
+    evidence = config.get("codex_shadow_inventory")
+    if not isinstance(evidence, dict):
+        return []
+    source, observed = evidence.get("source"), evidence.get("observed_at")
+    if not isinstance(source, str) or not source.strip() or source != source.strip():
+        return []
+    if not isinstance(observed, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)", observed):
+        return []
+    try:
+        datetime.fromisoformat(observed.replace("Z", "+00:00"))
+    except ValueError:
+        return []
+    models = evidence.get("models")
+    if not isinstance(models, list) or not models:
+        return []
+    rows, seen = [], set()
+    for spec in models:
+        if not isinstance(spec, dict):
+            return []
+        model = spec.get("id")
+        if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", model) or model in seen:
+            return []
+        seen.add(model)
+        context = spec.get("context_window")
+        if context is not None and (type(context) is not int or context <= 0):
+            return []
+        if any(spec.get(key) is not None and type(spec[key]) is not bool
+               for key in ("text", "vision", "tool_call")):
+            return []
+        rows.append({"provider": "openai-codex", "model": model,
+                     "context": context, "text": spec.get("text"),
+                     "vision": spec.get("vision"), "tool_call": spec.get("tool_call"),
+                     "price": None, "input": None, "output": None})
+    return rows
 
 
 def hermes_home() -> Path:

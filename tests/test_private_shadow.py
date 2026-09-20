@@ -22,7 +22,7 @@ class PrivateShadowTests(unittest.TestCase):
         self.settings = dict(routing='shadow', skills='on', notice='on', memory='off',
                              compaction='off', actions='off', supervision='off', escalation='off')
         self.sent = []
-        self.fail = False
+        self.transport_failed = False
         self.score = 1
         self.old_ctx = plugin._CTX
         self.addCleanup(setattr, plugin, '_CTX', self.old_ctx)
@@ -42,7 +42,7 @@ class PrivateShadowTests(unittest.TestCase):
 
     def transport(self, body, headers, timeout):
         self.sent.append(body)
-        if self.fail:
+        if self.transport_failed:
             raise plugin.route.client.JevError('auth_failed')
         return json.dumps({'answers': {
             'difficulty': {'type': 'score', 'score': self.score, 'confidence': 0.99},
@@ -118,7 +118,7 @@ class PrivateShadowTests(unittest.TestCase):
         transport.assert_not_called()
 
     def test_failed_routing_is_correlated_without_response(self):
-        self.fail = True
+        self.transport_failed = True
         self.assertIn('WOULD keep', self.turn())
         entry = self.logs()[-1]
         self.assertIn('auth_failed', entry['reason'])

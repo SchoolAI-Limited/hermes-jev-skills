@@ -48,6 +48,61 @@ configuration without reading credentials. No pools means a logged keep decision
 no routing classifier request. No key means fail-open; this guide grants no permission
 to connect a key, spend credits, restart a gateway or make live test requests.
 
+### Codex: explicit account evidence, shadow only
+
+For runtime provider `openai-codex`, merge an operator-supplied inventory into the
+same `routing.json`. The example below is **synthetic**, not an account catalog:
+
+```json
+{
+  "codex_shadow_inventory": {
+    "source": "operator-reviewed-synthetic-account-catalog",
+    "observed_at": "2026-01-02T03:04:05Z",
+    "models": [
+      {"id": "synthetic-fit", "context_window": 16000, "text": true,
+       "vision": true, "tool_call": true}
+    ]
+  },
+  "tiers": {"medium": {"general": ["openai-codex:synthetic-fit"]}}
+}
+```
+
+Copy exact IDs and supported fields from the operator's verified account catalog,
+not the public vendor API catalog. Record a nonempty provenance label in `source`
+and the actual observation time in `observed_at` (ISO timestamp with seconds and
+`Z` or numeric timezone offset). This is static evidence, not automatic discovery,
+freshness validation or a live reachability claim. Reverify it outside the adapter
+if account access changes; never include credentials or raw account responses.
+
+- Only the intersection of this inventory and the configured, ordered tier pools
+  can be selected. `openai:` references do not match `openai-codex:` references;
+  unverified pins cannot bypass evidence. Missing/malformed evidence keeps the
+  current model without calling the routing classifier or discovering a catalog.
+- `context_window` must be a positive integer. Use the verified ordinary window,
+  **not** a larger `max_context_window` without proof that it is active. The latter
+  is not consumed. The middleware estimates request size and the existing policy
+  requires 25% context headroom; this is not a tokenizer or a context-fit guarantee.
+- `text`, `vision` and `tool_call` are optional booleans, with omitted/null values
+  remaining unknown. Text and context must be known; vision is required for image
+  history, and tool support for requests containing tools. Text/image support is
+  **not** proof of tool support. If the supplied catalog does not establish the
+  latter, tool-bearing turns keep their current model until separately verified.
+- No auth files, environment credentials, native auth loaders, vendor catalog
+  enrichment or provider network requests are used by this inventory path. The
+  ordinary Jev classifier still uses its existing transport/key mechanism.
+- Only plugin `routing=shadow` can use this adapter. Active Codex routing remains
+  unsupported and keeps the request unchanged, including after a mode change in
+  the same turn. Direct `route.decide` callers must explicitly pass `shadow=True`
+  and `only_provider="openai-codex"`; the CLI is not an activation path.
+- Subscription prices remain unknown. No API-dollar savings or price-ranked tier
+  suggestions are inferred. Pool order is operator policy, not a measured cost
+  ranking. Review three days of skips, eligible decisions and classifier failures
+  separately; no fabricated candidate or savings should improve the trial totals.
+
+Keep the private-profile, feature-only and OFF settings above. This addition does
+not enable private skill disclosure or any other feature. Live hook delivery and
+account eligibility still require operator-owned verification after review.
+
 ### Gates and compatibility
 
 - `memory`, `compaction`, `actions` (both GUI and browser) and `supervision` default to

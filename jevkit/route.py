@@ -166,7 +166,8 @@ def dead_axis(config: Dict[str, Any]) -> List[str]:
 
 
 def _pick(config: Dict[str, Any], rows: Dict[str, Dict[str, Any]], tier: str, specialty: str,
-          need_vision: bool, context_tokens: int, only_provider: Optional[str] = None) -> Optional[str]:
+          need_vision: bool, context_tokens: int, only_provider: Optional[str] = None,
+          need_tools: bool = True) -> Optional[str]:
     tiers = config.get("tiers") or {}
     order = [tier] + [t for t in TIERS[TIERS.index(tier):] if t != tier]  # never fall DOWN a tier
     for candidate_tier in order:
@@ -178,6 +179,15 @@ def _pick(config: Dict[str, Any], rows: Dict[str, Dict[str, Any]], tier: str, sp
                 if only_provider and ref.split(":", 1)[0] != only_provider:
                     continue          # a plugin can swap the model, not the provider it is already connected to
                 row = rows.get(ref)
+                if ref.startswith("openai-codex:"):
+                    # No pin trust or vendor alias for subscription candidates. This path
+                    # is reachable only with validated evidence in explicit Codex shadow.
+                    if only_provider != "openai-codex" or row is None:
+                        continue
+                    if row.get("text") is not True or (need_tools and row.get("tool_call") is not True):
+                        continue
+                    if not row.get("context") or (need_vision and row.get("vision") is not True):
+                        continue
                 if row is None:          # pinned by the user but unknown to the catalog: trust the pin
                     if not need_vision:
                         return ref
@@ -279,6 +289,7 @@ def decide(
     profile: Optional[str] = None, pinned: bool = False, config: Optional[Dict[str, Any]] = None,
     rows: Optional[List[Dict[str, Any]]] = None, transport: Optional[client.Transport] = None,
     timeout: float = 2.5, only_provider: Optional[str] = None, session_id: str = "",
+    shadow: bool = False, need_tools: bool = True,
 ) -> Dict[str, Any]:
     """Route one fresh user turn. Call it once per turn, never inside a tool loop."""
     config = config or load_config()
@@ -288,6 +299,17 @@ def decide(
         return _keep(current, "no tiers configured; run `jev models suggest --write`")
     if not prompt.strip():
         return _keep(current, "empty turn")
+    codex = only_provider == "openai-codex" or (current or "").startswith("openai-codex:")
+    if codex:
+        if shadow is not True or only_provider != "openai-codex":
+            return _keep(current, "openai-codex supports explicit shadow routing only")
+        rows = catalog_mod.codex_shadow_models(config)  # never trust injected/vendor rows
+        if not rows:
+            return _keep(current, "missing or malformed Codex shadow inventory")
+        by_ref = {_ref(row): row for row in rows}
+        if not any(_pick(config, by_ref, tier, specialty, has_images, context_tokens,
+                         only_provider, need_tools) for tier in TIERS for specialty in SPECIALTIES):
+            return _keep(current, "no verified Codex shadow candidate fits this turn")
 
     # Judge the ask, not the contract around it. A scheduled or queued turn is a standing brief wrapped
     # around one real instruction; unwrap to that first. Whatever is left, a long turn keeps its opening
@@ -300,7 +322,7 @@ def decide(
     # A recurring job repeats its instruction verbatim, so buy the decision once and reuse it.
     cache_key = None
     if config.get("cache_repeat_asks", True):
-        cache_material = json.dumps([ask, config, current, context_tokens], sort_keys=True)
+        cache_material = json.dumps([ask, config, current, context_tokens, need_tools], sort_keys=True)
         cache_key = _cache_key(cache_material, profile, only_provider, has_images, bool(pinned))
         cached = _DECISIONS.get(cache_key)
         if cached is not None:
@@ -354,7 +376,7 @@ def decide(
 
     catalog_rows = rows if rows is not None else catalog_mod.models()
     by_ref = {_ref(row): row for row in catalog_rows}
-    picked = _pick(config, by_ref, tier, specialty, has_images, context_tokens, only_provider)
+    picked = _pick(config, by_ref, tier, specialty, has_images, context_tokens, only_provider, need_tools)
     if not picked:
         return _keep(current, f"no {tier} model fits this turn", private=private)
 
@@ -367,7 +389,7 @@ def decide(
     provider, model = picked.split(":", 1)
     escalation = None
     settings = config.get("escalation") or {}
-    if tier == "hard" and settings.get("enabled") and settings.get("rungs"):
+    if not codex and tier == "hard" and settings.get("enabled") and settings.get("rungs"):
         # A frontier seat is worth its cost only on work that earned the hard tier. Everything
         # below hard stays on OpenRouter, which is the whole point of paying for frontier seats.
         escalation = ladder.choose(settings["rungs"])
