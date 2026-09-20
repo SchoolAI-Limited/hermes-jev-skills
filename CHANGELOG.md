@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.12.1 (2026-09-19)
+
+- **The browser runner died the first time Jev chose to type.** The TypeSafe key fell back
+  to the secret store; the text-model key only read the environment, and an agent's
+  environment carries neither. It started cleanly and then failed with "TYPE_TEXT needs
+  TEXT_MODEL_API_KEY" — on most sites at the very first action. Every test and demo had
+  been run from a shell where the key was exported by hand. It now falls back the same way.
+- **Real agents, one end goal each, timed.** DevBot drove *Pizza* to *Roman Empire* by links
+  only: verified, 5 steps, 76.5 s wall clock. Donna drove System Settings to General then
+  Storage: verified, 2 steps, 7.9 s inside the runner, 36.4 s wall clock. The Jev loop is
+  8-12 s of that; the rest is the agent around it starting up, reading the skill and
+  composing one command. That overhead, not Jev, is what is worth attacking next.
+
 ## 0.12.0 (2026-09-19)
 
 Give it the end state, not the hops.

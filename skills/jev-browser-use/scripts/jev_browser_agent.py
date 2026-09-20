@@ -85,7 +85,12 @@ def resolve_credentials(env: dict, lookup=None) -> dict:
     if lookup is None:
         lookup = keychain_get
     typesafe = env.get("TYPESAFE_API_KEY") or lookup(*KEYCHAIN_TYPESAFE)
-    text_key = env.get("TEXT_MODEL_API_KEY") or env.get("OPENROUTER_API_KEY")
+    # The TypeSafe key already fell back to the secret store; the text key did not. An
+    # agent's environment carries neither, so the loop started fine and then died the
+    # first time Jev chose to TYPE - which on most sites is the very first action. It
+    # only ever worked from a shell where someone had exported the key by hand.
+    text_key = (env.get("TEXT_MODEL_API_KEY") or env.get("OPENROUTER_API_KEY")
+                or lookup("OPENROUTER_API_KEY", env.get("USER") or os.environ.get("USER", "")))
     resolved = {}
     if typesafe:
         resolved["TYPESAFE_API_KEY"] = typesafe

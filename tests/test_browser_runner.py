@@ -103,3 +103,33 @@ class AllowlistTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CredentialFallbackTests(unittest.TestCase):
+    """An agent's environment carries no keys. The TypeSafe key fell back to the secret
+    store; the text-model key did not. So the loop started fine and died the first time
+    Jev chose to TYPE - on most sites the very first action - with "TYPE_TEXT needs
+    TEXT_MODEL_API_KEY". It only ever worked from a shell where someone had exported the
+    key by hand, which is how every test and every demo had been run.
+    """
+
+    def test_the_text_key_falls_back_to_the_secret_store(self):
+        seen = []
+
+        def lookup(service, account):
+            seen.append(service)
+            return "sk-from-the-keychain" if service == "OPENROUTER_API_KEY" else "ts-key"
+
+        creds = runner.resolve_credentials({"USER": "someone"}, lookup=lookup)
+        self.assertEqual(creds.get("TEXT_MODEL_API_KEY"), "sk-from-the-keychain")
+        self.assertIn("OPENROUTER_API_KEY", seen)
+
+    def test_an_explicit_environment_key_still_wins(self):
+        creds = runner.resolve_credentials(
+            {"TEXT_MODEL_API_KEY": "sk-explicit", "USER": "someone"},
+            lookup=lambda service, account: "sk-from-the-keychain")
+        self.assertEqual(creds["TEXT_MODEL_API_KEY"], "sk-explicit")
+
+    def test_no_key_anywhere_is_simply_absent_not_an_error(self):
+        creds = runner.resolve_credentials({"USER": "someone"}, lookup=lambda s, a: None)
+        self.assertNotIn("TEXT_MODEL_API_KEY", creds)
