@@ -11,6 +11,8 @@ metadata:
 
 # Handing hard work to a frontier model, and watching it
 
+On Hermes, respect the `escalation` / `supervision` plugin gate. If OFF, continue without this Jev feature; do not bypass it through a direct CLI command or runner. Private shadow trials explicitly disable this feature. The handler blocks explicit tool calls while OFF; this is not a global CLI sandbox.
+
 Frontier seats are bought for frontier work. Everything else goes to a cheap model, and
 that is not a compromise — it is the reason there is quota left when something genuinely
 hard arrives.

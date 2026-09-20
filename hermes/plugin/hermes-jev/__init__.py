@@ -113,9 +113,13 @@ def _on_pre_llm_call(session_id: str = "", turn_id: Any = None, user_message: An
         _TURNS[session_id or "-"] = {"turn_id": turn_id, "text": text, "decision": None}
     if _setting("skills", "off") != "on" or not text.strip():
         return None
-    picked = skillpick.pick(text, skillpick.discover([_home() / "skills"], disabled=_disabled_skills()), top_k=1)
-    _log({"kind": "skill", "status": picked.get("status"), "needs_skill": picked.get("needs_skill"),
-          "picked": [s["name"] for s in picked.get("skills", [])], "latency_ms": picked.get("latency_ms")})
+    private = _profile() in (route.load_config().get("private_profiles") or [])
+    skills = [] if private else skillpick.discover([_home() / "skills"], disabled=_disabled_skills())
+    picked = skillpick.pick(text, skills, top_k=1, profile=_profile())
+    _log({"kind": "skill", "session_id": session_id, "turn_id": turn_id,
+          "status": picked.get("status"), "skipped": picked.get("skipped"), "reason": picked.get("reason"),
+          "needs_skill": picked.get("needs_skill"), "picked_count": len(picked.get("skills", [])),
+          "latency_ms": picked.get("latency_ms")})
     if not picked.get("skills"):
         return None
     skill = picked["skills"][0]
@@ -143,36 +147,47 @@ def _on_llm_request(request: Optional[Dict[str, Any]] = None, session_id: str = 
         default_bare = str(default).split(":", 1)[-1] if default else ""
         messages = request.get("messages") or request.get("input") or []
         decision = route.decide(
-            turn["text"], current=current, profile=_profile(), only_provider=catalog_provider, session_id=session_id,
+            turn["text"], current=current, profile=_profile(), only_provider=catalog_provider,
+            config=_routing_config(),
             context_tokens=len(json.dumps(messages, default=str)) // 4,
             has_images="image_url" in json.dumps(messages[-1:], default=str),
             pinned=bool(default_bare) and bare != default_bare)   # you ran /model: your choice wins
         turn["decision"] = decision
-        _log({"kind": "route", "mode": mode, "from": current, **{k: decision.get(k) for k in (
+        _log({"kind": "route", "mode": mode, "session_id": session_id, "turn_id": turn_id, "from": current, **{k: decision.get(k) for k in (
             # has_images is logged so a reader can tell the vision pool from the general
             # one after the fact. Without it a model listed in both is unattributable, and
             # "is the specialty answer earning its keep?" cannot be answered from the log.
             "routed", "model", "tier", "specialty", "has_images", "confidence", "difficulty",
-            "costly_mistake", "private", "reason", "latency_ms", "policy")}})
+            "costly_mistake", "private", "reason", "latency_ms", "policy", "cached")}})
     if mode != "on" or not decision.get("routed") or not decision.get("model_id"):
         return None
     return {"request": {**request, "model": decision["model_id"]}}
 
 
-def _on_transform_output(response_text: str = "", session_id: str = "", **_: Any) -> Any:
-    if _setting("notice", "off") != "on" or _setting("routing", "off") != "on":
+def _on_transform_output(response_text: str = "", session_id: str = "", turn_id: Any = None, **_: Any) -> Any:
+    mode = _setting("routing", "off")
+    if _setting("notice", "off") != "on" or mode not in ("on", "shadow"):
         return None
     with _LOCK:
         turn = _TURNS.get(session_id or "-")
-    decision = (turn or {}).get("decision")
-    if not decision or not decision.get("routed"):
+    if turn_id is not None and (turn or {}).get("turn_id") != turn_id:
         return None
-    return f"{decision['notice']}\n\n{response_text}"
+    decision = (turn or {}).get("decision")
+    if not decision:
+        return None
+    if mode == "shadow":
+        action = "WOULD route to" if decision.get("routed") else "WOULD keep"
+        return f"[Jev shadow] {action} {decision.get('model') or 'current model'}; no model changed.\n\n{response_text}"
+    if decision.get("routed"):
+        return f"{decision['notice']}\n\n{response_text}"
+    return None
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
 
 def _escalate(args: Dict[str, Any]) -> Dict[str, Any]:
+    if not _enabled("escalation"):
+        return {"status": "disabled", "reason": "escalation is off"}
     rungs = ((route.load_config().get("escalation") or {}).get("rungs")) or []
     if not rungs:
         return {"status": "not_configured",
@@ -191,8 +206,30 @@ def _escalate(args: Dict[str, Any]) -> Dict[str, Any]:
     return ladder.choose(rungs)
 
 
-def _tool(fn: Any) -> Any:
-    def handler(args: Dict[str, Any], **_: Any) -> str:
+_GATES = {"jev_memory_filter": "memory", "jev_compact_select": "compaction",
+          "jev_choose_action": "actions", "jev_supervise": "supervision", "jev_escalate": "escalation"}
+
+
+def _enabled(feature: str) -> bool:
+    # Preserve existing tool availability unless explicitly disabled. Escalation was opt-in.
+    default = "on" if feature != "escalation" else (
+        "on" if (route.load_config().get("escalation") or {}).get("enabled") else "off")
+    return _setting(feature, default) == "on"
+
+
+def _routing_config() -> Dict[str, Any]:
+    config = route.load_config()
+    if not _enabled("escalation"):
+        config = {**config, "escalation": {"enabled": False, "rungs": []}}
+    return config
+
+
+def _tool(fn: Any, feature: str = "") -> Any:
+    def handler(args: Dict[str, Any], **context: Any) -> str:
+        if feature and not _enabled(feature):
+            _log({"kind": feature, "status": "disabled", "session_id": context.get("session_id", ""),
+                  "turn_id": context.get("turn_id")})
+            return json.dumps({"status": "disabled", "reason": "feature is off; continue without Jev"})
         try:
             return json.dumps(fn(args or {}), default=str)
         except Exception as error:  # noqa: BLE001 - a tool must answer, not raise
@@ -255,8 +292,8 @@ _TOOLS = {
 def _jev_command(raw_args: str = "") -> str:
     words = (raw_args or "").split()
     everyone = len(words) == 3 and words[2] == "all"
-    if len(words) in (2, 3) and words[0] in ("routing", "skills", "notice") and words[1] in ("on", "off", "shadow") \
-            and (len(words) == 2 or everyone):
+    if len(words) in (2, 3) and words[0] in ("routing", "skills", "notice", "memory", "compaction", "actions", "supervision", "escalation") and words[1] in ("on", "off", "shadow") \
+            and (words[1] != "shadow" or words[0] == "routing") and (len(words) == 2 or everyone):
         path = _state_path(shared=everyone)
         state = _read(path)
         state[words[0]] = words[1]
@@ -268,36 +305,28 @@ def _jev_command(raw_args: str = "") -> str:
     tiers = route.load_config().get("tiers") or {}
     lines = [f"Jev key: {'present' if key['present'] else 'MISSING (run `jev setup-key` on this machine)'}",
              f"routing: {_setting('routing', 'off')} · skills: {_setting('skills', 'off')} · notice: {_setting('notice', 'off')}",
+             "tool gates: " + " · ".join(f"{name}={'on' if _enabled(name) else 'off'}" for name in _GATES.values()),
              f"tiers configured: {', '.join(sorted(tiers)) or 'none (run `jev models suggest --write`)'}",
-             "usage: /jev routing on|shadow|off [all] · /jev skills on|off [all] · /jev notice on|off [all]"]
+             "usage: /jev routing on|shadow|off [all] · /jev <skills|notice|memory|compaction|actions|supervision|escalation> on|off [all]"]
     return "\n".join(lines)
-
-
-_RULE_ESCALATION = (
-    " When a turn is genuinely hard, jev_escalate names the frontier seat to hand it to; use it for hard work only, "
-    "and report a quota refusal back through it so other agents skip that seat. While delegated work runs, poll "
-    "jev_supervise instead of re-reading the transcript."
-)
-
-_RULE = (
-    "Jev is a fast decision model available through tools. It picks, ranks and gates; it never writes. Use "
-    "jev_memory_filter after any retrieval that returns more than five passages, jev_compact_select before writing a "
-    "handoff or summary of a long conversation, and jev_choose_action to pick each GUI or browser step from your own "
-    "table of prevalidated actions. Never send Jev credentials, customer data or anything marked private. "
-    "If a Jev tool fails open, carry on normally."
-)
 
 
 def register(ctx: Any) -> None:
     global _CTX
     _CTX = ctx
     for name, (description, properties, required, fn) in _TOOLS.items():
-        ctx.register_tool(name=name, toolset="jev", handler=_tool(fn), schema={
+        ctx.register_tool(name=name, toolset="jev", handler=_tool(fn, _GATES[name]), schema={
             "name": name, "description": description,
             "parameters": {"type": "object", "properties": properties, "required": required}})
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("transform_llm_output", _on_transform_output)
     ctx.register_middleware("llm_request", _on_llm_request)
     ctx.register_command("jev", _jev_command, description="Jev status and switches", args_hint="[routing|skills|notice on|shadow|off [all]]")
-    rule = _RULE + (_RULE_ESCALATION if ((route.load_config().get("escalation") or {}).get("enabled")) else "")
+    rules = {"memory": "Use jev_memory_filter after retrieval.",
+             "compaction": "Use jev_compact_select before a long summary.",
+             "actions": "Use jev_choose_action for prevalidated computer/browser actions.",
+             "supervision": "Use jev_supervise to check delegated work.",
+             "escalation": "Use jev_escalate for hard work only."}
+    rule = "Never send Jev credentials, customer data or anything marked private. Disabled tools must not be used; carry on normally. "
+    rule += " ".join(text for feature, text in rules.items() if _enabled(feature))
     ctx.register_system_prompt_section("hermes-jev", rule, max_chars=1400)

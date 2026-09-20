@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.1 (unreleased)
+
+- Private profiles skip the entire skill-selection request, including catalog metadata.
+- Explicit plugin tool gates cover memory, compaction, computer/browser actions, supervision
+  and escalation; shadow notices say no model changed. Local decision records carry turn
+  and session IDs without forwarding them to Jev. Configuration changes invalidate cache.
+- Opt-in Hermes-only installer scope selects plugins, skills and scripts without touching
+  other profiles, agent folders or the CLI link; scoped check/uninstall share that scope.
+- Synthetic offline tests cover privacy, gates, notices, correlation and scoped lifecycle.
+
+
 ## 0.10.0 (2026-09-19)
 
 - **The specialization axis was silently dead, and is restored.** Routing pools are two

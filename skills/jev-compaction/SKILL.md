@@ -10,6 +10,8 @@ metadata:
 
 # Compaction and handoffs with Jev
 
+On Hermes, respect the `compaction` plugin gate. If OFF, continue without this Jev feature; do not bypass it through a direct CLI command or runner. Private shadow trials explicitly disable this feature. The handler blocks explicit tool calls while OFF; this is not a global CLI sandbox.
+
 Jev cannot write a summary. What it does is read the transcript turn by turn and mark each one:
 
 - **keep**: carries a decision, a constraint, a preference, unfinished work, or an exact value, path, id, command or error that later work depends on. Survives word for word.

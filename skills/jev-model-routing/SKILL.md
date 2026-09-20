@@ -21,7 +21,7 @@ With the `hermes-jev` plugin enabled, each fresh user turn is routed once, befor
 /jev routing shadow     decide and log, but do not switch (start here)
 /jev routing on         switch models
 /jev routing off
-/jev notice on          show "[Jev] medium · coding → kimi-k2.7-code · confidence 0.97" on routed replies
+/jev notice on          show the decision; in shadow: "WOULD route to …; no model changed."
 ```
 
 A plugin can swap the model, not the provider connection. On OpenRouter that still means every vendor (DeepSeek, GLM, Kimi, MiniMax, Grok, Qwen, Gemini, GPT). If you run `/model` yourself, your choice wins and Jev stays out of the way.
@@ -64,4 +64,6 @@ Use `model_id` from the reply. `routed: false` means stay where you are; `reason
 
 ## Tuning
 
-Decisions are logged without prompt text to `<hermes home>/logs/jev-decisions.jsonl`. Run in `shadow` for a day, read which tier real turns land in, then move models between pools. Change thresholds from your own traces, never from a hunch.
+For a private, scoped trial, use [the private shadow guide](../../docs/private-shadow-trial.md); do not enable routing to obtain notices.
+
+Decisions include local `session_id` and `turn_id` (not sent to Jev), cache hits, skipped private skill requests and route failures. They are logged without prompt or response text to `<hermes home>/logs/jev-decisions.jsonl`. Run in `shadow` for a day, read which tier real turns land in, then move models between pools. Change thresholds from your own traces, never from a hunch.
