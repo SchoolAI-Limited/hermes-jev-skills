@@ -203,12 +203,21 @@ def install_skills(folder: Path, check: bool) -> Dict[str, object]:
     return {"folder": str(folder), "skills": SKILLS}
 
 
-def install_cli(check: bool) -> Dict[str, object]:
+def install_cli(check: bool, hermes_home: "Path | None" = None) -> Dict[str, object]:
     target = Path.home() / ".local" / "bin" / "jev"
     if not check:
         _link(REPO / "bin" / "jev", target)
     on_path = str(target.parent) in os.environ.get("PATH", "").split(os.pathsep)
-    return {"command": str(target), "on_path": on_path}
+    # A Hermes agent shell does not carry ~/.local/bin, but it does carry the Hermes
+    # home's own bin directory. Without this second link every skill that says
+    # `jev choose` dies with command not found in exactly the place those skills run.
+    shim = None
+    if hermes_home is not None and (hermes_home / "config.yaml").is_file():
+        shim = hermes_home / "bin" / "jev"
+        if not check:
+            _link(REPO / "bin" / "jev", shim)
+    return {"command": str(target), "on_path": on_path,
+            **({"agent_shell_command": str(shim)} if shim else {})}
 
 
 def path_warning(cli: Dict[str, object]) -> str | None:
@@ -217,7 +226,7 @@ def path_warning(cli: Dict[str, object]) -> str | None:
     This lived inside the ``cli`` object, where nobody read it, and the very next command
     the docs give a person — ``jev setup-key`` — died with "command not found".
     """
-    if cli["on_path"]:
+    if cli["on_path"] or cli.get("agent_shell_command"):
         return None
     command = Path(str(cli["command"]))
     return (f"The `jev` command goes to {command}, but {command.parent} is not on PATH, so "
@@ -276,8 +285,10 @@ def main() -> int:
             report["hermes"] = uninstall_hermes(hermes)
         report["skills_removed"] = [str(f / n) for f in folders for n in SKILLS if _remove(f / n)]
         _remove(home / ".local" / "bin" / "jev")
+        if hermes.is_dir():
+            _remove(hermes / "bin" / "jev")
     else:
-        cli = install_cli(args.check)
+        cli = install_cli(args.check, hermes)
         report["cli"] = cli
         warnings += [w for w in (path_warning(cli),) if w]
         if (hermes / "config.yaml").is_file():

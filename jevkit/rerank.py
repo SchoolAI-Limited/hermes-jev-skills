@@ -52,7 +52,7 @@ INSTRUCTION_PATTERNS = re.compile(
     r"|developer\s+mode"
     # The trailing \b is there because "You are now able to copy the file" matched "now a".
     r"|you\s+are\s+now\s+(in|a|an|the|dan|free|unrestricted|jailbroken)\b"
-    r"|(reveal|print|output|send|email|exfiltrate)\s+(me\s+)?(the\s+|your\s+)?"
+    r"|(reveal|print|output|send|email|exfiltrate)\s+(me\s+)?(the\s+|your\s+|any\s+|some\s+|all\s+)?"
     r"(api[\s_-]?key|key|secret|token|password|credentials?)"
     r"|(reveal|print|output|repeat|show)\s+(me\s+)?your\s+(system\s+)?(prompt|instructions)"
     r"|(do\s+not|don'?t|never)\s+(tell|inform|alert|notify)\s+the\s+(user|operator|human|person)\s+(about|that\s+you)"

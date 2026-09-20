@@ -1535,3 +1535,37 @@ class ConfidenceFloorTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"JEV_MIN_CONFIDENCE": "not-a-number"}):
             self.assertEqual(importlib.reload(choose).MIN_CONFIDENCE, 0.65)
         importlib.reload(choose)
+
+
+class AskQuestionShapeTests(unittest.TestCase):
+    """`jev ask` is the raw escape hatch, and its help text says "{state, questions}".
+    A list of question objects (the shape every other Jev surface writes) used to crash
+    with AttributeError: 'list' object has no attribute 'items'."""
+
+    def _run(self, payload):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from jevkit import cli
+        args = SimpleNamespace(timeout=1.0)
+        with mock.patch.object(cli.client, "ask", return_value={"answers": {}, "usage": {}}) as ask:
+            with mock.patch.object(cli, "_stdin_json", return_value=payload):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = cli.cmd_ask(args)
+        return code, ask.call_args[0][1]
+
+    def test_a_list_of_questions_becomes_a_named_mapping(self):
+        code, questions = self._run({
+            "state": {"task": "x"},
+            "questions": [{"id": "q1", "kind": "score", "text": "hard?"},
+                          {"kind": "choice", "text": "which?"}],
+        })
+        self.assertEqual(code, 0)
+        self.assertEqual(list(questions), ["q1", "q2"])
+        self.assertNotIn("id", questions["q1"])
+        self.assertEqual(questions["q1"]["kind"], "score")
+
+    def test_a_mapping_of_questions_is_still_passed_through(self):
+        code, questions = self._run({"state": {"task": "x"}, "questions": {"q1": {"kind": "score"}}})
+        self.assertEqual(code, 0)
+        self.assertEqual(list(questions), ["q1"])

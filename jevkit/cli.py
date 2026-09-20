@@ -344,8 +344,18 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     request = _stdin_json()
+    questions = request["questions"]
+    # The help text, and every other Jev surface, write questions as a list of
+    # {id, kind, text}. client.ask wants them keyed by name, so a list used to die with
+    # AttributeError: 'list' object has no attribute 'items'.
+    if isinstance(questions, list):
+        questions = {
+            str(q.get("id") or "q%d" % (position + 1)): {k: v for k, v in q.items() if k != "id"}
+            for position, q in enumerate(questions)
+            if isinstance(q, dict)
+        }
     try:
-        return _out(client.ask(request["state"], request["questions"], timeout=args.timeout))
+        return _out(client.ask(request["state"], questions, timeout=args.timeout))
     except client.JevError as error:
         _out({"error": error.code})
         return 2
@@ -457,7 +467,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8791)
     p.set_defaults(func=cmd_dashboard)
 
-    p = sub.add_parser("ask", help="raw Jev call: {state, questions}")
+    p = sub.add_parser("ask", help='raw Jev call: {"state": ..., "questions": [{"id","kind","text"}]} '
+                                   'or a mapping of name -> {type: choice|score|noul, instructions, criteria}')
     p.add_argument("--timeout", type=float, default=5)
     p.set_defaults(func=cmd_ask)
     return parser
