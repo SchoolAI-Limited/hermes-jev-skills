@@ -90,3 +90,58 @@ class PortabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SidebarRowTests(unittest.TestCase):
+    """macOS sidebars are AXOutline -> AXRow -> AXStaticText. The row is clickable and
+    unlabelled; the label sits on a non-interactive child. Filtering on role alone dropped
+    every sidebar item, so on System Settings "Displays" was in the tree and never offered
+    - Jev answered at 0.35 confidence because the right answer was not on the table.
+    With the pairing it answered at 0.90 and the click verified.
+    """
+
+    STATE = {"elements": [
+        {"role": "AXRow", "frame": {"x": 949, "y": 880, "w": 215, "h": 32},
+         "actions": ["AXShowDefaultUI"]},
+        {"role": "AXStaticText", "label": "Displays", "element_token": "t1",
+         "frame": {"x": 963, "y": 884, "w": 78, "h": 24}, "actions": ["AXShowMenu"]},
+        {"role": "AXStaticText", "label": "Just a caption", "element_token": "t2",
+         "frame": {"x": 100, "y": 100, "w": 120, "h": 20}, "actions": []},
+    ]}
+
+    def test_a_label_inside_a_row_is_offered_as_that_row(self):
+        rows = gui.element_rows(self.STATE, 26, [])
+        offered = {r["label"]: r for r in rows}
+        self.assertIn("Displays", offered)
+        self.assertEqual(offered["Displays"]["role"], "AXRow")
+        self.assertEqual(offered["Displays"]["token"], "t1")
+
+    def test_loose_static_text_is_still_not_clickable(self):
+        """Otherwise every caption on screen becomes a candidate and floods the table."""
+        rows = gui.element_rows(self.STATE, 26, [])
+        self.assertNotIn("Just a caption", {r["label"] for r in rows})
+
+
+class InstalledLocationTests(unittest.TestCase):
+    def test_jevkit_is_found_from_an_installed_skill_directory(self):
+        """Walking parent directories only works inside the checkout. Installed under
+        ~/.hermes/skills/ - the only place an agent runs it - every call failed with
+        "jevkit not importable". It passed every test because every test ran from the
+        checkout, which is the whole lesson."""
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            (home / "plugins" / "hermes-jev" / "jevkit").mkdir(parents=True)
+            (home / "plugins" / "hermes-jev" / "jevkit" / "choose.py").write_text("")
+            profile = home / "profiles" / "donna"
+            profile.mkdir(parents=True)
+            saved = os.environ.get("HERMES_HOME")
+            try:
+                os.environ["HERMES_HOME"] = str(profile)     # a PROFILE dir, as in production
+                found = gui._repo_root()
+            finally:
+                if saved is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = saved
+        self.assertIsNotNone(found)

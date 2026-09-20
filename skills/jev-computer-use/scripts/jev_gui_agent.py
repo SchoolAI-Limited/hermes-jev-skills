@@ -30,10 +30,33 @@ from pathlib import Path
 # ---------------------------------------------------------------- jevkit
 
 def _repo_root() -> Path | None:
+    """Find jevkit from wherever this file actually lives.
+
+    The first version only walked its own parent directories, which works inside the
+    repo checkout and NOWHERE ELSE. Installed as a skill under ~/.hermes/skills/ — the
+    only place an agent ever runs it from — no parent holds jevkit, so every agent got
+    "jevkit not importable" on the first call. It passed every test because every test
+    ran from the checkout. The installer vendors jevkit inside the Hermes plugin, and
+    the `jev` CLI symlink points into a checkout, so both are searched.
+    """
     here = Path(__file__).resolve()
     for parent in here.parents:
         if (parent / "jevkit" / "choose.py").is_file():
             return parent
+    homes = [os.environ.get("HERMES_HOME"), str(Path.home() / ".hermes")]
+    for home in filter(None, homes):
+        root = Path(home)
+        # HERMES_HOME is often a PROFILE dir (<root>/profiles/<name>); plugins live at the root.
+        bases = [root] + ([root.parent.parent] if root.parent.name == "profiles" else [])
+        for base in bases:
+            candidate = base / "plugins" / "hermes-jev"
+            if (candidate / "jevkit" / "choose.py").is_file():
+                return candidate
+    cli = shutil.which("jev")
+    if cli:
+        for parent in Path(cli).resolve().parents:
+            if (parent / "jevkit" / "choose.py").is_file():
+                return parent
     return None
 
 
@@ -228,14 +251,34 @@ def element_rows(state: dict, max_regions: int, tokens: list[str] | None = None)
         bw, bh = float(content.get("w", 0)), float(content.get("h", 0))
     rows: list[dict] = []
     seen: set[tuple[str, int, int]] = set()
+    # macOS sidebars, lists and tables are AXOutline/AXTable -> AXRow -> AXStaticText. The
+    # ROW is what you click and it carries no label; the LABEL is on a child static text
+    # that is not interactive. Filtering on role alone therefore dropped every sidebar
+    # item: on System Settings "Displays" was in the tree and never offered, so Jev
+    # answered with 0.35 confidence because the right answer was not on the table. The
+    # tree is flat, so the pairing is geometric: a label whose frame sits inside a row's
+    # frame is that row's name.
+    row_frames = [el.get("frame") for el in state.get("elements", [])
+                  if el.get("role") in ("AXRow", "AXCell") and el.get("frame")]
+
+    def _in_a_row(frame: dict) -> bool:
+        cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2
+        cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2
+        return any(float(r.get("x", 0)) <= cx <= float(r.get("x", 0)) + float(r.get("w", 0))
+                   and float(r.get("y", 0)) <= cy <= float(r.get("y", 0)) + float(r.get("h", 0))
+                   for r in row_frames)
+
     for el in state.get("elements", []):
         label = (el.get("label") or "").strip()
         if not label:
             continue
         role = el.get("role") or ""
         acts = el.get("actions") or []
-        if role not in INTERACTIVE_ROLES and "AXPress" not in acts:
+        row_label = role == "AXStaticText" and bool(el.get("frame")) and _in_a_row(el["frame"])
+        if role not in INTERACTIVE_ROLES and "AXPress" not in acts and not row_label:
             continue
+        if row_label:
+            role = "AXRow"           # describe it to Jev as what it is: a selectable row
         frame = el.get("frame") or {}
         x, y = float(frame.get("x", 0)), float(frame.get("y", 0))
         w, h = float(frame.get("w", 0)), float(frame.get("h", 0))
