@@ -61,6 +61,8 @@ class Seat:
 def _price(model: str, prices: Mapping[str, Mapping[str, float]]) -> Optional[Dict[str, float]]:
     if model in prices:
         return dict(prices[model])
+    if model.startswith("openai-codex:"):
+        return None  # subscription prices cannot inherit a vendor API price by bare ID
     bare = model.split(":", 1)[-1]
     for key, value in prices.items():
         if key.split(":", 1)[-1] == bare:

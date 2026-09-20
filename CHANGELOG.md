@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.2 (unreleased)
+
+- Explicit, provenance-labeled Codex account inventory enables shadow-only decisions
+  through existing tier/specialty classification. Unknown context/capabilities cannot
+  authorize candidates; vendor aliases and unverified pins cannot widen the pool.
+- Codex remains a distinct runtime provider, never changes requests (including after
+  a shadow-to-active switch), and never inherits vendor API prices as subscription costs.
+- Synthetic acceptance tests cover evidence, eligibility, mode gates and private disclosure.
+
 ## 0.10.1 (unreleased)
 
 - Private profiles skip the entire skill-selection request, including catalog metadata.

@@ -26,6 +26,14 @@ With the `hermes-jev` plugin enabled, each fresh user turn is routed once, befor
 
 A plugin can swap the model, not the provider connection. On OpenRouter that still means every vendor (DeepSeek, GLM, Kimi, MiniMax, Grok, Qwen, Gemini, GPT). If you run `/model` yourself, your choice wins and Jev stays out of the way.
 
+For `openai-codex`, use **shadow only** and the explicit `codex_shadow_inventory`
+in existing `routing.json`, as described in [the private shadow guide](../../docs/private-shadow-trial.md).
+Use operator-verified account IDs and ordinary context/capability fields with source
+and observation time, not API-vendor aliases or automatic model suggestions. Unknown
+required fields keep the current model; text/image support does not establish tool
+support. Subscription prices and savings stay unknown. Active Codex routing is not
+supported; do not turn it on after the trial or infer that a shadow candidate ran.
+
 ## Asking directly (any agent)
 
 Before delegating a task or spawning a sub-agent, ask which model should get it:
