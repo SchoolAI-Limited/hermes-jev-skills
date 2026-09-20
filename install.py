@@ -115,7 +115,17 @@ def enable_plugins(config: Path, names: Sequence[str], enable: bool) -> Dict[str
                     block.insert(0, "  enabled:")
                     key = 0
                 block[key] = "  enabled:"          # turns `enabled: []` into a block list
-                block.insert(key + 1, f"  - {name}")
+                # YAML permits both indentless and indented sequences. Match
+                # the existing list: mixing them folds later items into a scalar.
+                indent = "  "
+                for following in block[key + 1:]:
+                    if not following.strip() or following.lstrip().startswith("#"):
+                        continue
+                    match = re.match(r"^( +)-\s", following)
+                    if match:
+                        indent = match.group(1)
+                    break
+                block.insert(key + 1, f"{indent}- {name}")
                 status[name] = "enabled"
             else:
                 if not present:
