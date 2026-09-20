@@ -20,6 +20,11 @@ Built for [Hermes](https://github.com/NousResearch/hermes-agent). The skills and
 
 ## Install
 
+For a single-home, plugin-only private shadow evaluation, follow the
+[private shadow trial guide](docs/private-shadow-trial.md) instead of the broad install
+below. It documents explicit OFF gates, private skill skips, scoped check/uninstall and
+operator approval boundaries.
+
 **Point your agent at this repo** and say: *"Install Hermes Jev Skills from https://github.com/kerpopule/hermes-jev-skills"*. It will follow [AGENTS.md](AGENTS.md).
 
 **Got it as a zip?** Unzip it anywhere, then run the second and third commands below from that folder.

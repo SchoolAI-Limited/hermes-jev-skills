@@ -10,6 +10,8 @@ metadata:
 
 # Memory filtering with Jev
 
+On Hermes, respect the `memory` plugin gate. If OFF, continue without this Jev feature; do not bypass it through a direct CLI command or runner. Private shadow trials explicitly disable this feature. The handler blocks explicit tool calls while OFF; this is not a global CLI sandbox.
+
 Your memory store stays the source of truth. Jev does not store or recall anything. After your normal retrieval returns a shortlist, Jev decides in one request which passages deserve your context window.
 
 ## Do this

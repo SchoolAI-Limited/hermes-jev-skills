@@ -117,7 +117,7 @@ def _on_pre_llm_call(session_id: str = "", turn_id: Any = None, user_message: An
     skills = [] if private else skillpick.discover([_home() / "skills"], disabled=_disabled_skills())
     picked = skillpick.pick(text, skills, top_k=1, profile=_profile())
     _log({"kind": "skill", "session_id": session_id, "turn_id": turn_id,
-          "status": picked.get("status"), "skipped": picked.get("skipped"),
+          "status": picked.get("status"), "skipped": picked.get("skipped"), "reason": picked.get("reason"),
           "needs_skill": picked.get("needs_skill"), "picked_count": len(picked.get("skills", [])),
           "latency_ms": picked.get("latency_ms")})
     if not picked.get("skills"):
@@ -164,12 +164,14 @@ def _on_llm_request(request: Optional[Dict[str, Any]] = None, session_id: str = 
     return {"request": {**request, "model": decision["model_id"]}}
 
 
-def _on_transform_output(response_text: str = "", session_id: str = "", **_: Any) -> Any:
+def _on_transform_output(response_text: str = "", session_id: str = "", turn_id: Any = None, **_: Any) -> Any:
     mode = _setting("routing", "off")
     if _setting("notice", "off") != "on" or mode not in ("on", "shadow"):
         return None
     with _LOCK:
         turn = _TURNS.get(session_id or "-")
+    if turn_id is not None and (turn or {}).get("turn_id") != turn_id:
+        return None
     decision = (turn or {}).get("decision")
     if not decision:
         return None

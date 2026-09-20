@@ -23,6 +23,7 @@ class PrivateShadowTests(unittest.TestCase):
                              compaction='off', actions='off', supervision='off', escalation='off')
         self.sent = []
         self.fail = False
+        self.score = 1
         self.old_ctx = plugin._CTX
         self.addCleanup(setattr, plugin, '_CTX', self.old_ctx)
         plugin._TURNS.clear()
@@ -44,7 +45,7 @@ class PrivateShadowTests(unittest.TestCase):
         if self.fail:
             raise plugin.route.client.JevError('auth_failed')
         return json.dumps({'answers': {
-            'difficulty': {'type': 'score', 'score': 1, 'confidence': 0.99},
+            'difficulty': {'type': 'score', 'score': self.score, 'confidence': 0.99},
             'kind': {'type': 'choice', 'choice': 'general', 'confidence': 0.99,
                      'probabilities': {'general': 1}},
             'costly_mistake': {'type': 'noul', 'noul': 0.1},
@@ -83,6 +84,30 @@ class PrivateShadowTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertTrue(self.logs()[-1]['cached'])
         self.assertEqual(self.logs()[-1]['turn_id'], 'next-local-turn')
+
+    def test_notice_off_and_stale_notice_do_not_change_shadow_request(self):
+        self.settings['notice'] = 'off'
+        self.assertIsNone(self.turn())
+        self.settings['notice'] = 'on'
+        self.assertIsNone(plugin._on_transform_output('response', 'local-session-id', 'stale-turn'))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_hard_shadow_with_escalation_off_never_calls_ladder(self):
+        self.score = 2.8
+        self.config['tiers'] = {'hard': {'general': ['test:hard']}}
+        with mock.patch.object(plugin.ladder, 'choose', side_effect=AssertionError('ladder called')):
+            self.assertIn('WOULD route to test:hard', self.turn())
+            self.assertEqual(plugin._escalate({'action': 'clear'})['status'], 'disabled')
+
+    def test_compatibility_defaults_and_on_handler(self):
+        for feature in plugin._GATES.values():
+            self.settings.pop(feature)
+        self.assertTrue(all(plugin._enabled(feature) for feature in plugin._GATES.values()))
+        fn = mock.Mock(return_value={'status': 'ok'})
+        self.assertEqual(json.loads(plugin._tool(fn, 'memory')({'synthetic': True})), {'status': 'ok'})
+        fn.assert_called_once_with({'synthetic': True})
+        self.config['escalation'] = {'enabled': False}
+        self.assertFalse(plugin._enabled('escalation'))
 
     def test_private_skill_library_skips_entire_catalog_request(self):
         transport = mock.Mock(side_effect=AssertionError('must not send'))
@@ -157,6 +182,22 @@ class ScopedInstallerTests(unittest.TestCase):
             self.assertEqual((other / 'config.yaml').read_text(), CONFIG)
             for sentinel in sentinels:
                 self.assertEqual(sentinel.read_text(), 'untouched')
+
+    def test_selected_skills_uninstall_preserves_unselected_skills(self):
+        with tempfile.TemporaryDirectory(dir=REPO) as tmp:
+            home = Path(tmp)
+            (home / 'config.yaml').write_text(CONFIG)
+            flags = ['--hermes-only', '--hermes-home', str(home), '--plugins', 'none',
+                     '--skills', 'jev-skill-select', '--scripts', 'none', '--enable', 'none']
+            run_installer(flags, home)
+            self.assertTrue((home / 'skills/jev/jev-skill-select/SKILL.md').is_file())
+            self.assertFalse((home / 'plugins').exists())
+            self.assertEqual((home / 'config.yaml').read_text(), CONFIG)
+            unrelated = home / 'skills/jev/keep.txt'
+            unrelated.write_text('untouched')
+            run_installer(flags + ['--uninstall'], home)
+            self.assertFalse((home / 'skills/jev/jev-skill-select').exists())
+            self.assertEqual(unrelated.read_text(), 'untouched')
 
     def test_scoped_symlink_escape_refused(self):
         with tempfile.TemporaryDirectory(dir=REPO) as tmp:

@@ -11,6 +11,8 @@ metadata:
 
 # Browser use with Jev
 
+On Hermes, respect the `actions` plugin gate. If OFF, continue without this Jev feature; do not bypass it through a direct CLI command or runner. Private shadow trials explicitly disable this feature. The handler blocks explicit tool calls while OFF; this is not a global CLI sandbox.
+
 If a plain HTTP fetch can read it, fetch it and leave the browser alone. This skill is for pages that need interaction.
 
 Jev never writes selectors, code or coordinates. It picks one operation and one target from the list of elements your browser tool observed. There are two ways to run it.

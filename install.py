@@ -83,6 +83,8 @@ def enable_plugins(config: Path, names: Sequence[str], enable: bool) -> Dict[str
     A text edit, not a YAML round-trip: comments, ordering and every other setting survive.
     One pass for all of them, so a two-plugin install leaves one backup rather than two.
     """
+    if not names:
+        return {}
     text = config.read_text(encoding="utf-8")
     lines = text.split("\n")
     status: Dict[str, str] = {}

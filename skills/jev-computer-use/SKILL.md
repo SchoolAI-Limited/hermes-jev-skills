@@ -11,6 +11,8 @@ metadata:
 
 # Computer use with Jev
 
+On Hermes, respect the `actions` plugin gate. If OFF, continue without this Jev feature; do not bypass it through a direct CLI command or runner. Private shadow trials explicitly disable this feature. The handler blocks explicit tool calls while OFF; this is not a global CLI sandbox.
+
 You stay the planner and the hands. Jev is only the fast "which one next?" in the middle. It returns an id from a table **you** built, so it cannot invent coordinates, text, selectors or tool calls. The worst a wrong answer can do is pick another action you already judged safe.
 
 Web pages belong to `jev-browser-use`. This skill is for desktop apps and OS surfaces, driven through whatever computer-use driver you have (CUA Driver over MCP, the platform's native computer-use tool, an accessibility bridge).

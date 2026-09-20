@@ -16,6 +16,8 @@ Two requests, about 0.9 s for a few hundred skills. The first ranks every skill 
 
 `/jev skills on` makes the `hermes-jev` plugin do this once per fresh turn. When a skill clearly fits, a one-line suggestion is attached to the turn naming it; load it with `skill_view` unless it plainly does not apply. It reads the profile's skills folder and respects `skills.disabled`.
 
+Profiles listed in `routing.json` → `private_profiles` skip the **entire** skill request, even with `skills=on`. Neither turn text nor skill names/descriptions are sent. There is no semantic surrogate; an empty suggestion is the intended fail-open result. Normal local skill discovery remains available to the agent.
+
 ## Asking directly (any agent)
 
 ```bash
