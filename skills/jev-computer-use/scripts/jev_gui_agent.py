@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -345,20 +346,41 @@ def offscreen_matches(state: dict, tokens: list[str], limit: int = 3) -> list[st
     return found[:limit]
 
 
+def _stable_id(kind: str, label: str, used: set[str]) -> str:
+    """An id for "this element", not for "this snapshot's handle to it"."""
+    slug = re.sub(r"[^a-z0-9]+", "-", _fold(label))[:36].strip("-") or "item"
+    base = f"{kind}:{slug}"
+    cid, n = base, 2
+    while cid in used:
+        cid, n = f"{base}-{n}", n + 1
+    used.add(cid)
+    return cid
+
+
 def build_table(rows: list[dict], below: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     regions: list[dict] = []
     candidates: list[dict] = []
+    used: set[str] = set()
     for i, r in enumerate(rows):
         rid = f"r{i}"
         regions.append({
             "id": rid, "role": r["role"].replace("AX", "").lower(),
             "label": single_line(r["label"]), "interactive": True,
         })
-        verb = "Type into" if r["role"] in ("AXTextField", "AXSearchField") else "Click"
+        typing = r["role"] in ("AXTextField", "AXSearchField")
+        verb = "Type into" if typing else "Click"
+        # The id used to be `click:<element_token>`, and the driver reissues every token
+        # on every observation. So no id in `history` was ever still on the table, and
+        # Jev had no way to see it had already clicked something: given "open General,
+        # then Storage" it clicked General ten times running. An id built from what the
+        # element IS survives re-observation, so history means something.
+        r["cid"] = _stable_id("type" if typing else "click", r["label"], used)
+        state = " It is the currently selected item, so clicking it again changes nothing." \
+            if r.get("selected") else ""
         candidates.append({
-            "id": f"{'type' if verb == 'Type into' else 'click'}:{r['token']}",
+            "id": r["cid"],
             "description": f"{verb} [{i}] {r['role'].replace('AX','').lower()} "
-                           f"\"{single_line(r['label'])}\".",
+                           f"\"{single_line(r['label'])}\".{state}",
         })
     for extra, desc in STANDARD_ACTIONS:
         if extra == "scroll-down" and below:
@@ -407,7 +429,7 @@ def execute(driver: Driver, pid: int, window_id: int, session: str,
             action: str, rows: list[dict], goal: str, values: list[str]) -> tuple[str, str]:
     """Run exactly one pre-validated action. Returns (op, detail)."""
     if action.startswith("click:"):
-        token = action.split(":", 1)[1]
+        token = next((r["token"] for r in rows if r.get("cid") == action), None)
         for r in rows:
             if r["token"] == token:
                 res = driver.tool("click", with_session({
@@ -417,7 +439,7 @@ def execute(driver: Driver, pid: int, window_id: int, session: str,
                 return "click", json.dumps(_brief(res))
         return "click", "target token no longer observed"
     if action.startswith("type:"):
-        token = action.split(":", 1)[1]
+        token = next((r["token"] for r in rows if r.get("cid") == action), None)
         for r in rows:
             if r["token"] == token:
                 text = text_helper(goal, r["label"], values)
@@ -624,7 +646,10 @@ def main(argv: list[str] | None = None) -> int:
             log.append({"step": step, "action": action, "op": op,
                         "detail": detail, "confidence": confidence,
                         "decision_ms": jev_ms, "action_ms": action_ms})
-            history.append({"selected_id": action, "outcome": f"{op}: {detail[:80]}"})
+            what = next((f'{r["role"].replace("AX", "").lower()} "{single_line(r["label"], 40)}"'
+                         for r in rows if r.get("cid") == action), action)
+            history.append({"selected_id": action,
+                            "outcome": f"{op} {what} - {single_line(detail, 60)}"})
             if op == "no-op":
                 time.sleep(0.3)
             if not action.startswith(("click:", "type:")):

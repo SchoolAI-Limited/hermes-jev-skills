@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.12.0 (2026-09-19)
+
+Give it the end state, not the hops.
+
+- **Both runners are end-goal loops, and the skills now say so.** I had been feeding the
+  browser runner one stepping stone at a time and told an agent to do the same. That was
+  wrong: Jev Ultrafast's own instruction is *"advance the user's entire goal from the
+  current page"*. One sentence took Wikipedia from *Pizza* to *Roman Empire* links-only in
+  12.6 s and *Banana* to *Albert Einstein* in 35 s, scrolling and routing itself.
+- **A goal needs the end state plus what counts as progress.** Without the second part it
+  stops on tick 1 — correctly, since `BLOCKED` means nothing visible serves the goal. Same
+  task, one added sentence ("a related stepping-stone article counts as progress"):
+  blocked with zero clicks became verified in 12.6 s. `jev-browser-use` now teaches this,
+  and no longer claims ten steps is plenty (that race took 59).
+- **The desktop runner had no memory, so it could not pursue an end goal at all.** Ids
+  were `click:<element_token>` and the driver reissues every token per observation, so
+  nothing in `history` was ever still on the table. Asked to "open General, then Storage"
+  it clicked General ten times — every click confirmed, none of them progress — and
+  failed in 22 s. Ids are now built from what the element *is*, history records what was
+  clicked by name, and Jev is told which item is already selected. Same goal: two steps,
+  7.8 s, the second at 0.98 confidence.
+- Not infallible: *Kangaroo* to *Apollo 11* failed by scrolling one article for 20 s
+  without ever committing to a stepping stone. Name better stepping stones in the goal;
+  do not fall back to feeding hops.
+
 ## 0.11.0 (2026-09-19)
 
 Ran it for real, against a real app, with a stopwatch. Most of this is what that found.

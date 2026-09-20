@@ -187,3 +187,46 @@ class VerifyProofTests(unittest.TestCase):
     def test_an_unselected_row_is_still_not_proof(self):
         """The original false pass, which the selected-row rule must not reintroduce."""
         self.assertFalse(gui.verify([{"label": "Library", "selected": False}], "Home", "Library"))
+
+
+class MemoryTests(unittest.TestCase):
+    """A loop with no memory cannot pursue an end goal, only a single step.
+
+    Candidate ids were `click:<element_token>` and the driver reissues every token on every
+    observation, so nothing in `history` was ever still on the table. Given "open General,
+    then open Storage" it clicked General TEN times running - each click confirmed, none
+    of them progress - and failed in 22 s. With ids that survive re-observation it took two
+    steps and 7.8 s, the second at 0.98 confidence.
+    """
+
+    def _rows(self, token_suffix, selected=False):
+        return [{"label": "General", "role": "AXRow", "token": f"s{token_suffix}:1", "selected": selected},
+                {"label": "Storage", "role": "AXRow", "token": f"s{token_suffix}:2"}]
+
+    def test_an_element_keeps_its_id_when_the_driver_reissues_its_token(self):
+        _, first = gui.build_table(self._rows("0001"))
+        _, second = gui.build_table(self._rows("0002"))          # new snapshot, new tokens
+        ids = lambda table: [c["id"] for c in table if c["id"].startswith("click:")]
+        self.assertEqual(ids(first), ids(second))
+        self.assertNotIn("s0001", " ".join(ids(first)))          # no snapshot handle in an id
+
+    def test_ids_satisfy_the_chooser_contract(self):
+        import re
+        rows = [{"label": "AirDrop & Continuity / (beta) #1", "role": "AXRow", "token": "t"}]
+        _, table = gui.build_table(rows)
+        self.assertRegex(table[0]["id"], r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+
+    def test_duplicate_labels_still_get_distinct_ids(self):
+        rows = [{"label": "Search", "role": "AXButton", "token": "a"},
+                {"label": "Search", "role": "AXButton", "token": "b"}]
+        _, table = gui.build_table(rows)
+        clicks = [c["id"] for c in table if c["id"].startswith("click:")]
+        self.assertEqual(len(clicks), len(set(clicks)))
+
+    def test_jev_is_told_which_item_is_already_selected(self):
+        """Otherwise re-clicking the open pane looks like a perfectly good next move."""
+        _, table = gui.build_table(self._rows("0001", selected=True))
+        general = next(c for c in table if "General" in c["description"])
+        storage = next(c for c in table if "Storage" in c["description"])
+        self.assertIn("currently selected", general["description"])
+        self.assertNotIn("currently selected", storage["description"])
