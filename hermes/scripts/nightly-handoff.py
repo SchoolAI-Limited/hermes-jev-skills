@@ -290,8 +290,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         def build(session_id: str, lane: str, confidential: bool = confidential) -> Dict[str, Any]:
             return ho.build(session_id, lane, write=writer,
-                            select=(compact.select if compact else None),
-                            digest=(compact.digest if compact else None),
+                            select=(compact.select if (compact and ho.jev_prepass_enabled()) else None),
+                            digest=(compact.digest if (compact and ho.jev_prepass_enabled()) else None),
                             prompt_for=(compact.handoff_prompt if compact else None),
                             valid=(compact.looks_like_capsule if compact else None),
                             confidential=confidential,

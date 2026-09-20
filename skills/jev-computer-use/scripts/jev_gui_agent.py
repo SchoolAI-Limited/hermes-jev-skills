@@ -21,6 +21,10 @@ become optional, because a command that opens an app cannot know its window befo
     --goal 'Open System Settings, go to General and then open Storage' \
     --expect 'Storage' --json
 
+A plan can come from jevkit's plan cache instead of the model (JEV_MEMO=on; the default only
+records whether it would have matched). Every step is still observed, chosen, executed and
+verified here either way, and a run that fails a step or ends unverified forgets its plan.
+
 Exit codes: 0 verified, 4 unverified, 2 refused to start, 6 abstained.
 """
 from __future__ import annotations
@@ -34,7 +38,6 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -443,11 +446,22 @@ def build_table(rows: list[dict], below: list[str] | None = None) -> tuple[list[
 # ---------------------------------------------------------------- text helper
 
 def text_helper(goal: str, field_label: str, values: list[str]) -> str:
+    """Which of the ALLOWED values goes into this field. Only ever one of ``values``.
+
+    Two faults lived here. With exactly one allowed value it still asked a text model to
+    "choose the best one" from a list of one: a network call with a 30 s timeout, in the
+    middle of a step, for an answer that was never in doubt. And whatever the model replied
+    was typed as it came, so a reply that was not on the list put text into a field that
+    the person never allowed. ``--values`` is the whole of what may be typed; the model
+    only gets to pick from it.
+    """
     key = os.environ.get("TEXT_MODEL_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("TEXT_MODEL", "google/gemini-2.5-flash")
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
-    if not key or not values:
-        return values[0] if values else ""
+    if not values:
+        return ""
+    if not key or len(values) == 1:
+        return values[0]
     prompt = (
         "You write one short value to type into a GUI field. Reply as JSON "
         '{"text": "..."} and nothing else.\n'
@@ -458,17 +472,18 @@ def text_helper(goal: str, field_label: str, values: list[str]) -> str:
         "model": model, "temperature": 0,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
-    req = urllib.request.Request(
-        f"{base.rstrip('/')}/chat/completions", data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
     try:
+        req = urllib.request.Request(
+            f"{base.rstrip('/')}/chat/completions", data=body,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=30) as fh:
             payload = json.load(fh)
         raw = payload["choices"][0]["message"]["content"].strip()
         raw = raw.strip("`").removeprefix("json").strip()
-        return str(json.loads(raw).get("text", "")).strip() or values[0]
-    except (urllib.error.URLError, KeyError, ValueError, TimeoutError):
+        chosen = str(json.loads(raw).get("text", "")).strip()
+        return chosen if chosen in values else values[0]
+    except Exception:  # noqa: BLE001 - a reply shaped as a list, a reset socket: the first value, not a traceback
         return values[0]
 
 
@@ -911,13 +926,35 @@ def run_direct(driver: Driver, where: dict, session: str, step: dict,
     return (False, why) if why else (True, json.dumps(_brief(res)))
 
 
+def forget_plan(goal: str, outcome: dict) -> None:
+    """Take this command's plan out of the plan cache, once, and never at the run's expense.
+
+    A cached plan is served again for a week. One that led to a failed step or to an end
+    state nobody could verify may be the reason it failed, and serving it again turns one
+    bad run into every run. It costs one model call to be wrong about that.
+    """
+    context = outcome.get("planned_for")
+    outcome["planned_for"] = None        # a failed step and an unverified end are one forget, not two
+    # getattr: the installer vendors jevkit, so this script can meet one whose planner has
+    # no cache. Then there is nothing to forget.
+    forget = getattr(jev_plan, "forget", None)
+    if not context or forget is None:
+        return
+    try:
+        forget(goal, front_app=context["front_app"], running_apps=context["running_apps"])
+        print("  plan cache: forgot this plan, so the next run asks the model again")
+    except Exception:  # noqa: BLE001 - forget() promises not to raise; the exit code must not depend on it
+        pass
+
+
 def run_plan(driver: Driver, where: dict, args: argparse.Namespace, values: list[str],
              regions_cap: int, *, planner=None, opener=subprocess.run, sleep=time.sleep) -> dict:
     """Plan once, then run each step directly or through the Jev loop.
 
-    Returns what run_goal returns, plus ``report`` for the --json result. ``--max-steps``
-    stays the ceiling on Jev calls for the WHOLE command, not per step, so a plan cannot
-    turn a bounded run into steps x budget.
+    Returns what run_goal returns, plus ``report`` for the --json result and ``planned_for``,
+    the context main() needs to forget the plan. ``--max-steps`` stays the ceiling on Jev
+    calls for the WHOLE command, not per step, so a plan cannot turn a bounded run into
+    steps x budget.
     """
     windows = list_windows(driver)
     front = front_window(windows)
@@ -926,9 +963,9 @@ def run_plan(driver: Driver, where: dict, args: argparse.Namespace, values: list
         name = str(window.get("app_name") or "")
         if name and name not in running:
             running.append(name)
+    front_app = str((front or {}).get("app_name") or "")
     try:
-        planned = (planner or jev_plan.plan)(
-            args.goal, front_app=str((front or {}).get("app_name") or ""), running_apps=running)
+        planned = (planner or jev_plan.plan)(args.goal, front_app=front_app, running_apps=running)
     except Exception as exc:  # noqa: BLE001 - plan() promises not to raise; the run must not depend on it
         planned = {"status": "fallback", "reason": f"planner_error:{type(exc).__name__}",
                    "steps": [{"kind": "goal"}]}
@@ -936,8 +973,10 @@ def run_plan(driver: Driver, where: dict, args: argparse.Namespace, values: list
         planned = {"status": "fallback", "reason": "no_plan", "steps": [{"kind": "goal"}]}
     status = planned.get("status", "fallback")
     why = f" ({planned['reason']})" if planned.get("reason") else ""
+    # "miss" is also what an older jevkit with no plan cache amounts to: the model was asked.
+    cache = str(planned.get("cache", "miss"))
     print(f"  plan: {status}{why}, {len(planned.get('steps') or [])} step(s), "
-          f"{planned.get('latency_ms', 0)} ms")
+          f"{planned.get('latency_ms', 0)} ms, cache {cache}")
 
     # The plan is checked again here, whoever produced it. A step outside the vocabulary
     # is ignored and reported, never executed.
@@ -971,57 +1010,70 @@ def run_plan(driver: Driver, where: dict, args: argparse.Namespace, values: list
                   f"{item['step'].get('target', '')!r} - {item['reason']}")
 
     out: dict = {"used": 0, "abstained": False, "ended": "planned", "title": "", "rows": []}
+    # What forget_plan() needs. Only a real plan is ever stored, so a fallback has nothing
+    # to forget, and with JEV_MEMO=off nothing was stored either.
+    out["planned_for"] = ({"front_app": front_app, "running_apps": running}
+                          if status == "planned" and cache != "off" else None)
     history: list[dict] = []
     log: list[dict] = []
     stopped = ""
-    for index, step in enumerate(runnable, 1):
-        kind = step["kind"]
-        record = {"kind": kind, "target": step.get("target", ""),
-                  "mode": "direct" if kind in DIRECT_KINDS else "jev"}
-        if step.get("risky"):
-            record["risky"] = step["risky"]
-        if stopped:
-            records.append(dict(record, mode="not_run", ok=False, duration_ms=0, detail=stopped))
-            continue
-        t0 = time.time()
-        if kind in DIRECT_KINDS:
-            ok, detail = run_direct(driver, where, args.session, step, opener=opener, sleep=sleep)
-        else:
-            remaining = args.max_steps - out["used"]
-            if remaining <= 0:
-                ok, detail = False, "the --max-steps budget is spent"
-            elif not _aim(driver, where):
-                ok, detail = False, "no window to act on"
+    try:
+        for index, step in enumerate(runnable, 1):
+            kind = step["kind"]
+            record = {"kind": kind, "target": step.get("target", ""),
+                      "mode": "direct" if kind in DIRECT_KINDS else "jev"}
+            if step.get("risky"):
+                record["risky"] = step["risky"]
+            if stopped:
+                records.append(dict(record, mode="not_run", ok=False, duration_ms=0, detail=stopped))
+                continue
+            t0 = time.time()
+            if kind in DIRECT_KINDS:
+                ok, detail = run_direct(driver, where, args.session, step, opener=opener, sleep=sleep)
             else:
-                whole = kind == "goal"
-                part = run_goal(
-                    driver, where["pid"], where["window_id"], args.session,
-                    args.goal if whole else jev_plan.step_goal(step),
-                    expect=args.expect, values=values, regions_cap=regions_cap,
-                    budget=remaining, first_step=out["used"] + 1, history=history, log=log,
-                    until_op="" if whole else JEV_KINDS[kind],
-                    literal="" if whole else str(step.get("text") or ""))
-                out["used"] += part["used"]
-                out["abstained"] = out["abstained"] or part["abstained"]
-                out["title"], out["rows"] = part["title"], part["rows"]
-                record["jev_calls"] = part["used"]
-                ok = part["ended"] in ("acted", "done", "verified")
-                detail = part["ended"]
-                if part["ended"] == "verified":
-                    stopped = "the expected end state was already reached"
-        record.update(ok=ok, duration_ms=int((time.time() - t0) * 1000), detail=single_line(detail, 160))
-        records.append(record)
-        print(f"  plan step {index}/{len(runnable)}  {kind:<9} {record['mode']:<6} "
-              f"{record['duration_ms']:>5} ms  {'ok' if ok else 'FAILED'}  {record['detail'][:80]}")
-        # Later steps were planned on the assumption that this one happened. Typing into
-        # a window that failed to open is how text ends up somewhere it was never meant
-        # to go, so a failed step ends the plan.
-        if not ok and not stopped:
-            stopped = f"step {index} ({kind}) did not complete"
+                remaining = args.max_steps - out["used"]
+                if remaining <= 0:
+                    ok, detail = False, "the --max-steps budget is spent"
+                elif not _aim(driver, where):
+                    ok, detail = False, "no window to act on"
+                else:
+                    whole = kind == "goal"
+                    part = run_goal(
+                        driver, where["pid"], where["window_id"], args.session,
+                        args.goal if whole else jev_plan.step_goal(step),
+                        expect=args.expect, values=values, regions_cap=regions_cap,
+                        budget=remaining, first_step=out["used"] + 1, history=history, log=log,
+                        until_op="" if whole else JEV_KINDS[kind],
+                        literal="" if whole else str(step.get("text") or ""))
+                    out["used"] += part["used"]
+                    out["abstained"] = out["abstained"] or part["abstained"]
+                    out["title"], out["rows"] = part["title"], part["rows"]
+                    record["jev_calls"] = part["used"]
+                    ok = part["ended"] in ("acted", "done", "verified")
+                    detail = part["ended"]
+                    if part["ended"] == "verified":
+                        stopped = "the expected end state was already reached"
+            record.update(ok=ok, duration_ms=int((time.time() - t0) * 1000), detail=single_line(detail, 160))
+            records.append(record)
+            print(f"  plan step {index}/{len(runnable)}  {kind:<9} {record['mode']:<6} "
+                  f"{record['duration_ms']:>5} ms  {'ok' if ok else 'FAILED'}  {record['detail'][:80]}")
+            # Later steps were planned on the assumption that this one happened. Typing into
+            # a window that failed to open is how text ends up somewhere it was never meant
+            # to go, so a failed step ends the plan.
+            if not ok and not stopped:
+                stopped = f"step {index} ({kind}) did not complete"
+    except BaseException:
+        # Ctrl-C because the plan was doing the wrong thing, or a driver that died mid-step:
+        # that run did not end well either, and main() never sees this plan's context.
+        forget_plan(args.goal, out)
+        raise
+    if any(r["mode"] in ("direct", "jev") and not r["ok"] for r in records):
+        forget_plan(args.goal, out)
     out["log"] = log
     out["report"] = {
         "status": status, "reason": planned.get("reason", ""),
         "latency_ms": planned.get("latency_ms", 0), "model": planned.get("model", ""),
+        "cache": cache,
         "dropped": [{"kind": d.get("step", {}).get("kind"), "target": d.get("step", {}).get("target", ""),
                      "reason": d.get("reason", "")} for d in dropped if isinstance(d, dict)],
         "steps": records,
@@ -1131,6 +1183,10 @@ def main(argv: list[str] | None = None) -> int:
 
     steps, abstained = outcome["used"], outcome["abstained"]
     verified = verify(rows, title, args.expect)
+    if not verified:
+        # No --expect is unverified too, so a plan is only ever reused after a run that
+        # proved it reached the end state. That is the point: reuse has to be earned.
+        forget_plan(args.goal, outcome)
     result = {
         "schema": "hermes.computer_use_jev_run_v1",
         "goal": args.goal,

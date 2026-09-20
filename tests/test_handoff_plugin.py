@@ -842,6 +842,174 @@ class NightlyDryRunTests(unittest.TestCase):
         self.assertFalse(report["dry_run"])
 
 
+class RecoveryBlockTests(unittest.TestCase):
+    """A capsule is a few hundred words. What makes it enough is a way back to the rest."""
+
+    def setUp(self) -> None:
+        self.ho = load_handoff("ho_recovery")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"HERMES_HOME": self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HANDOFF_CONFIDENTIAL", None)
+        self.exports = 0
+
+    scrub = staticmethod(ConfidentialContractTests.scrub)
+
+    CAPSULE = "## Working on\nx\n## State\ny\n## Decisions\nd\n## Pointers\n/srv/app/render.toml\n## Next\nship it"
+
+    def runner(self, *args: Any, **kwargs: Any) -> Any:
+        self.exports += 1
+        messages = [{"role": "user" if i % 2 == 0 else "assistant",
+                     "content": f"turn {i}: the queue config is /srv/app/conf/render.toml on port 8431"}
+                    for i in range(self.turns)]
+        return mock.Mock(returncode=0, stdout=json.dumps({"messages": messages}))
+
+    turns = 12
+
+    def test_the_capsule_names_its_session_and_the_search_that_works(self):
+        """It carried no session id and never said a search exists, so the one mechanism
+        measured to work (a summary plus one search: 43% -> 79%) was out of reach."""
+        out = self.ho.build("20260101_000000_abc", "lane", write=lambda p: self.CAPSULE, runner=self.runner)
+        self.assertEqual(out["status"], "ok")
+        text = self.ho.capsule_path("lane").read_text(encoding="utf-8")
+        self.assertIn("## Recovery", text)
+        self.assertIn("`20260101_000000_abc` (12 messages)", text)
+        self.assertIn('around_message_id=<match_message_id>', text)
+        self.assertIn('role_filter="user,assistant,tool"', text)
+        # a list of the session's identifiers was tried and measured: no help, so none here
+        self.assertNotIn("most repeated first", text)
+        # query= together with session_id= reads from the top and ignores the query
+        self.assertNotRegex(text, r"session_search\(query=[^)]*session_id=")
+
+    def test_a_confidential_capsule_gets_no_recovery_block(self):
+        def prompt_for(body: str, previous: str = "", *, confidential: bool = False, marked: bool = True) -> str:
+            return body
+        out = self.ho.build("s1", "lane", write=lambda p: self.CAPSULE, prompt_for=prompt_for,
+                            valid=lambda t: True, confidential=True, scrub=self.scrub, runner=self.runner)
+        self.assertEqual(out["status"], "ok")
+        self.assertNotIn("## Recovery", self.ho.capsule_path("lane").read_text(encoding="utf-8"))
+
+    def test_the_next_capsule_does_not_inherit_the_last_ones_recovery_block(self):
+        """Left in `previous`, the writer copied it, and the note ended with two blocks
+        pointing at two different sessions."""
+        seen: List[str] = []
+
+        def prompt_for(body: str, previous: str = "", *, confidential: bool = False, marked: bool = True) -> str:
+            seen.append(previous)
+            return body
+        self.ho.build("first_session", "lane", write=lambda p: self.CAPSULE, prompt_for=prompt_for, runner=self.runner)
+        self.ho.build("second_session", "lane", write=lambda p: self.CAPSULE, prompt_for=prompt_for, runner=self.runner)
+        self.assertIn("## Pointers", seen[1])
+        self.assertNotIn("## Recovery", seen[1])
+        self.assertNotIn("first_session", seen[1])
+        text = self.ho.capsule_path("lane").read_text(encoding="utf-8")
+        self.assertEqual(text.count("## Recovery"), 1)
+        self.assertIn("second_session", text)
+
+    def test_a_plain_transcript_is_sent_untagged_with_a_prompt_that_knows_it(self):
+        """The shipped no-Jev path tagged every line [background] under a prompt saying
+        background "only needs its gist": an instruction to paraphrase the whole session."""
+        seen: Dict[str, Any] = {}
+
+        def prompt_for(body: str, previous: str = "", *, confidential: bool = False, marked: bool = True) -> str:
+            seen.update(body=body, marked=marked)
+            return body
+        self.ho.build("s1", "lane", write=lambda p: self.CAPSULE, prompt_for=prompt_for, runner=self.runner)
+        self.assertFalse(seen["marked"])
+        self.assertNotIn("[background]", seen["body"])
+
+        def select(messages: Any, keep_last: int = 8) -> Dict[str, Any]:
+            return {"status": "ok", "fates": {}, "counts": {}, "jev_calls": 1}
+        self.ho.build("s1", "lane", write=lambda p: self.CAPSULE, prompt_for=prompt_for, select=select,
+                      digest=lambda messages, selection, limit: "[KEEP VERBATIM] user: x", runner=self.runner)
+        self.assertTrue(seen["marked"])
+
+    def test_an_older_jevkit_without_the_marked_flag_still_gets_a_capsule(self):
+        def old_prompt_for(body: str, previous: str = "", *, confidential: bool = False) -> str:
+            return "PROMPT " + body
+        out = self.ho.build("s1", "lane", write=lambda p: self.CAPSULE, prompt_for=old_prompt_for, runner=self.runner)
+        self.assertEqual(out["status"], "ok")
+
+    def test_an_over_long_capsule_loses_its_middle_not_its_pointers_and_next(self):
+        """[:6000] cut the end, and the end is Pointers and Next: the exact paths and the
+        first thing to do, the two sections the next session cannot rebuild."""
+        long = ("## Working on\nx\n## State\n" + "filler sentence. " * 1200 +
+                "\n## Decisions\nd\n## Pointers\n/srv/app/render.toml\n## Next\nrestart the render unit")
+        self.assertGreater(len(long), self.ho.CAPSULE_MAX_CHARS)
+        fitted = self.ho._fit(long, self.ho.CAPSULE_MAX_CHARS)
+        self.assertLessEqual(len(fitted), self.ho.CAPSULE_MAX_CHARS)
+        self.assertIn("/srv/app/render.toml", fitted)
+        self.assertIn("restart the render unit", fitted)
+        self.assertIn("trimmed to fit", fitted)
+        self.assertEqual(self.ho._fit("short", 100), "short")
+
+    def test_a_very_long_lane_is_judged_on_its_recent_turns_only(self):
+        """600 turns was 15 Jev requests in a row, up to 8 s each, before the writer started."""
+        self.turns = 600
+        seen: List[int] = []
+
+        def select(messages: Any, keep_last: int = 8) -> Dict[str, Any]:
+            seen.append(len(messages))
+            return {"status": "ok", "fates": {}, "counts": {}, "jev_calls": 1}
+        out = self.ho.build("s1", "lane", write=lambda p: self.CAPSULE, select=select,
+                            digest=lambda messages, selection, limit: "digest", runner=self.runner)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(seen, [self.ho.MAX_JUDGED_TURNS])
+        self.assertIn("(600 messages)", self.ho.capsule_path("lane").read_text(encoding="utf-8"))
+
+
+class JevPrepassDefaultTests(unittest.TestCase):
+    """The pre-pass is opt-in because it was measured and lost. See evals/compaction."""
+
+    NAME = "hermes_handoff_prepass_under_test"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"HERMES_HOME": self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HANDOFF_JEV", None)
+        os.environ.pop("HANDOFF_CONFIDENTIAL", None)
+        self.plugin = load_plugin(self.NAME)
+        self.addCleanup(unload, self.NAME)
+
+    def wired(self) -> Dict[str, Any]:
+        """What run_handoff hands to build(), with a jevkit that has every helper."""
+        fake = types.SimpleNamespace(select=object(), digest=object(), handoff_prompt=object(),
+                                     looks_like_capsule=object(), redact_capsule=object())
+        seen: Dict[str, Any] = {}
+
+        def build(session_id: str, lane: str, **kwargs: Any) -> Dict[str, Any]:
+            seen.update(kwargs)
+            return {"status": "ok"}
+        with mock.patch.object(self.plugin, "_jevkit", lambda: fake), \
+                mock.patch.object(self.plugin.handoff, "build", build), \
+                mock.patch.object(self.plugin, "_writer", lambda: (lambda prompt: "x")):
+            self.plugin.run_handoff({"session_id": "s1", "platform": "cli"})
+        return seen
+
+    def test_with_a_key_and_no_opt_in_the_writer_gets_the_plain_tail(self):
+        seen = self.wired()
+        self.assertIsNone(seen["select"])
+        self.assertIsNone(seen["digest"])
+        # the prompt and the validator cost nothing and stay on
+        self.assertIsNotNone(seen["prompt_for"])
+        self.assertIsNotNone(seen["valid"])
+
+    def test_handoff_jev_turns_the_pre_pass_back_on(self):
+        for value in ("1", "true", "ON", " yes "):
+            with mock.patch.dict(os.environ, {"HANDOFF_JEV": value}):
+                seen = self.wired()
+                self.assertIsNotNone(seen["select"], value)
+                self.assertIsNotNone(seen["digest"], value)
+        for value in ("0", "", "off", "no"):
+            with mock.patch.dict(os.environ, {"HANDOFF_JEV": value}):
+                self.assertIsNone(self.wired()["select"], value)
+
+
 class ConfidentialPreviousCapsuleTests(unittest.TestCase):
     def test_a_previous_capsule_never_reinstates_keep_identifiers_under_confidentiality(self):
         """The last sentence the writer read said "Do not lose identifiers" - after the rules

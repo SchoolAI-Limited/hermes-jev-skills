@@ -115,9 +115,20 @@ so an outage is never mistaken for a plan. A step that fails ends the plan, beca
 after it assumed it happened; the run then reports unverified (exit 4). Rerun without `--plan`
 or take that hop by hand.
 
-The `--json` result gains a `plan` object: `status`, `reason`, `latency_ms`, `model`, `dropped`,
-and `steps`, each with `kind`, `target`, `mode` (`direct`, `jev`, `ignored` for a kind outside
-the vocabulary, `not_run` after a failure), `ok`, `duration_ms` and `detail`.
+The `--json` result gains a `plan` object: `status`, `reason`, `latency_ms`, `model`, `cache`,
+`dropped`, and `steps`, each with `kind`, `target`, `mode` (`direct`, `jev`, `ignored` for a kind
+outside the vocabulary, `not_run` after a failure), `ok`, `duration_ms` and `detail`.
+
+A repeated command need not be planned twice, and `plan.cache` says what the plan cache did.
+`JEV_MEMO=shadow`, the default, still asks the model every time and only records `shadow_agree`
+or `shadow_differ` against the stored plan. `JEV_MEMO=on` reuses the stored plan (`hit`) and
+skips the 1 second call; `off` stores nothing. Only the planning call is ever skipped: every
+step is still observed, chosen, executed and verified, and a stored plan goes through the same
+validation and never-send filter on every read. A command that looks sensitive is never
+stored, entries last 7 days, and a run that fails a step or ends unverified forgets its plan,
+so a plan is reused only after a run that passed its `--expect`. Stored steps include dictated
+text, in a private file on this machine; `JEV_MEMO=off` keeps nothing. The mode is the person's
+setting, not yours to change mid-task. Details: `docs/response-caches.md`.
 
 Three rules that are yours to keep:
 

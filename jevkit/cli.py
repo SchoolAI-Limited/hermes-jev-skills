@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, catalog, choose, client, compact, key_setup, keystore, ladder, plan, rerank, replay, route, skillpick, spend, supervise, triage
+from . import __version__, catalog, choose, client, compact, key_setup, keystore, ladder, memo, plan, rerank, replay, route, skillpick, spend, supervise, triage
 
 
 def _stdin_json() -> Any:
@@ -233,6 +233,13 @@ def cmd_choose(args: argparse.Namespace) -> int:
         raise SystemExit(f"invalid request: {error}") from None
 
 
+def cmd_memo(args: argparse.Namespace) -> int:
+    """Counts and sizes only. A cached plan is somebody's command, so it is never printed."""
+    if args.action == "clear":
+        return _out({"cleared": memo.clear(), "mode": memo.mode()})
+    return _out(memo.stats())
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """Plan a spoken-style command once, up front. Falls back to a single goal step, never raises."""
     command = " ".join(args.command).strip() if args.command else str(_stdin_json().get("command", "")).strip()
@@ -343,21 +350,119 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    request = _stdin_json()
-    questions = request["questions"]
-    # The help text, and every other Jev surface, write questions as a list of
-    # {id, kind, text}. client.ask wants them keyed by name, so a list used to die with
-    # AttributeError: 'list' object has no attribute 'items'.
-    if isinstance(questions, list):
-        questions = {
-            str(q.get("id") or "q%d" % (position + 1)): {k: v for k, v in q.items() if k != "id"}
-            for position, q in enumerate(questions)
-            if isinstance(q, dict)
-        }
+    """The raw call. Bad input is answered in JSON with exit 2 and is never sent."""
+
+    def shown(value: Any) -> str:
+        # A refusal quotes the caller's own id or type back. Quoted whole, a 1 MB type came
+        # back as a 1 MB error with the actual complaint at the far end of it.
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        return text if len(text) <= 80 else text[:77] + "..."
+
+    def wire(full_name: str, raw: Any) -> Dict[str, Any]:
+        """One question spelled the way Jev's wire format spells it, or ValueError saying what is wrong."""
+        name = shown(full_name)
+        if not isinstance(raw, dict):
+            raise ValueError(f'question "{name}" must be an object like {{"type": ..., "instructions": ...}}')
+        # The help text used to advertise {id, kind, text}. The wire format says type and
+        # instructions, so the advertised shape went out verbatim and client._check_answer
+        # died on question["type"] with a KeyError. Both spellings are accepted; only the
+        # wire one is sent. Any other key is passed through: this is the raw escape hatch.
+        question = {key: value for key, value in raw.items() if key not in ("id", "kind", "text")}
+        for alias, key in (("kind", "type"), ("text", "instructions")):
+            if alias in raw:
+                if key in raw and raw[key] != raw[alias]:
+                    raise ValueError(f'question "{name}" gives both "{key}" and "{alias}", and they disagree')
+                question[key] = raw[alias]
+        kind = question.get("type")
+        if kind not in ("choice", "score", "noul"):
+            found = "has no type" if kind is None else f"has unknown type {shown(json.dumps(kind, default=str))}"
+            raise ValueError(f'question "{name}" {found}; use one of choice, score, noul')
+        text = question.get("instructions")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f'question "{name}" has no instructions: the text of the question, as a string')
+        # A choice or score with no criteria has nothing to pick from. It used to be sent
+        # anyway, and then the reply check died reading question["criteria"].
+        if kind != "noul":
+            wanted, shape = ((dict, 'an object of at least two options, {"option": "what it means"}')
+                             if kind == "choice" else (list, "a list of at least two levels, lowest first"))
+            criteria = question.get("criteria")
+            if criteria is None:
+                raise ValueError(f'question "{name}": criteria are required for a {kind}, as {shape}')
+            if not isinstance(criteria, wanted) or len(criteria) < 2:
+                raise ValueError(f'question "{name}": criteria for a {kind} must be {shape}')
+        return question
+
+    def named(questions: Any) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(questions, (dict, list)):
+            raise ValueError('"questions" must be a list of questions, or an object of {name: question}')
+        if not questions:
+            raise ValueError('"questions" is empty; ask at least one')
+        pairs = list(questions.items()) if isinstance(questions, dict) else []
+        for position, raw in enumerate(questions if isinstance(questions, list) else (), 1):
+            ident = raw.get("id") if isinstance(raw, dict) else None
+            if isinstance(ident, bool) or not isinstance(ident, (str, int, type(None))):
+                raise ValueError(f"question {position} has an id that is not a string or a number")
+            # `q.get("id") or ...` read an id of 0 as missing and renamed the question.
+            pairs.append((f"q{position}" if ident in (None, "") else str(ident), raw))
+        out: Dict[str, Dict[str, Any]] = {}
+        for name, raw in pairs:
+            # Building the mapping straight from the list let a repeated id overwrite the
+            # earlier question, which was then never asked and never reported.
+            if name in out:
+                raise ValueError(f'two questions are both named "{shown(name)}"; ids must be unique, and a question '
+                                 f'with no id is named q1, q2, ... by its position')
+            out[name] = wire(name, raw)
+        return out
+
+    def no_repeats(pairs: List[Any]) -> Dict[str, Any]:
+        # json.loads keeps the last of two equal keys without a word. In the {name: question}
+        # form that is the duplicate-id bug again: the earlier question is never asked and
+        # never reported. The same goes for two options of one choice.
+        out: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError(f'the key "{shown(key)}" appears twice in one JSON object; the earlier one '
+                                 f'would be dropped without a word')
+            out[key] = value
+        return out
+
+    try:
+        # Not _stdin_json(): it cannot take the hook, and it only turns a JSONDecodeError into
+        # a message. stdin that is not UTF-8, is nested past the recursion limit, or (3.11+)
+        # holds an integer of 5000 digits came out as a traceback. Here all of it is bad
+        # input like any other, which is also what `jev ask --help` promises.
+        try:
+            request = json.loads(sys.stdin.read(2_000_000), object_pairs_hook=no_repeats)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"stdin is not valid JSON: {error}") from None
+        except UnicodeDecodeError:
+            raise ValueError("stdin is not valid JSON: it is not UTF-8 text") from None
+        except RecursionError:
+            raise ValueError("stdin is nested too deeply to read") from None
+        # urllib hands the timeout to the socket, which answers nan with ValueError and inf or
+        # 1e300 with OverflowError. Zero and below still come back as Jev's own "timeout".
+        if not args.timeout <= 3600:
+            raise ValueError("--timeout must be a number of seconds, at most 3600")
+        if not isinstance(request, dict):
+            raise ValueError('the request must be a JSON object: {"state": ..., "questions": ...}')
+        for field in ("state", "questions"):
+            if request.get(field) is None:
+                raise ValueError(f'the request has no "{field}"')
+        questions = named(request["questions"])
+    except ValueError as error:
+        # Same JSON-and-exit-2 contract a Jev failure gets below. The caller is an agent
+        # reading stdout, and a traceback on stderr never told it which field to fix.
+        _out({"error": "invalid_request", "detail": str(error)})
+        return 2
     try:
         return _out(client.ask(request["state"], questions, timeout=args.timeout))
     except client.JevError as error:
         _out({"error": error.code})
+        return 2
+    except RecursionError:
+        # A state nested a few levels short of what json.loads refuses is read fine here and
+        # then overflows json.dumps inside client.ask, which sits deeper in the stack.
+        _out({"error": "invalid_request", "detail": "the request, or Jev's reply, is nested too deeply to handle"})
         return 2
 
 
@@ -423,6 +528,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=plan.DEFAULT_TIMEOUT)
     p.set_defaults(func=cmd_plan)
 
+    p = sub.add_parser("memo", help="the plan cache: how many entries it holds, or empty it")
+    p.add_argument("action", choices=["stats", "clear"])
+    p.set_defaults(func=cmd_memo)
+
     p = sub.add_parser("triage", help="classify incoming messages: now / today / queue / ignore")
     p.add_argument("--file", help="JSON list of messages (subject, content, sender); else read stdin")
     p.add_argument("--customer-domain", action="append", help="a domain whose mail is a real customer (repeatable)")
@@ -467,8 +576,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8791)
     p.set_defaults(func=cmd_dashboard)
 
-    p = sub.add_parser("ask", help='raw Jev call: {"state": ..., "questions": [{"id","kind","text"}]} '
-                                   'or a mapping of name -> {type: choice|score|noul, instructions, criteria}')
+    # The example is the contract: a test reads it back out of this text and runs it, because
+    # the shape shown here before, [{"id","kind","text"}], was one Jev could not answer.
+    p = sub.add_parser(
+        "ask", formatter_class=argparse.RawDescriptionHelpFormatter,
+        help='raw Jev call: {"state": ..., "questions": [{"id", "type": choice|score|noul, "instructions", '
+             '"criteria"}]}; choice and score need criteria. `jev ask --help` has a full example',
+        description="""Ask Jev typed questions about one state. JSON on stdin, JSON on stdout.
+
+  {"state": "The deploy failed twice on the same migration step.",
+   "questions": [
+     {"id": "blocked", "type": "noul",
+      "instructions": "The work cannot continue until a person steps in"},
+     {"id": "next", "type": "choice", "instructions": "What should happen next?",
+      "criteria": {"retry": "Run the same step again", "escalate": "Hand it to a person"}},
+     {"id": "severity", "type": "score", "instructions": "How serious is this?",
+      "criteria": ["Cosmetic", "Degraded", "Down"]}]}
+
+questions is a list as above, or an object of name -> question. A question with no id is
+named q1, q2, ... by its position. "kind" and "text" are accepted for "type" and
+"instructions".
+
+  noul    the probability that the instructions are true. No criteria.
+  choice  one option out of criteria: an object of at least two "option": "what it means".
+  score   a position on criteria: a list of at least two levels, lowest first.
+
+Bad input prints {"error": "invalid_request", "detail": ...} and exits 2, and nothing is sent.
+A Jev failure prints {"error": code} and exits 2.""")
     p.add_argument("--timeout", type=float, default=5)
     p.set_defaults(func=cmd_ask)
     return parser

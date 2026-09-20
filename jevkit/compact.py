@@ -1,10 +1,15 @@
-"""Compaction and handoffs: Jev decides what survives, a text model only writes it up.
+"""Compaction and handoffs: Jev marks what survives, a text model only writes it up.
 
-Jev cannot summarize. What it can do, in one fast request, is read a transcript
-turn by turn and mark each turn as something to carry forward word for word, to
-fold into the summary, or to drop. The summarizing model then gets a fraction of
-the transcript with the decisions, open work and pointers already pulled out, so
-the handoff is shorter, cheaper, and stops losing the one line that mattered.
+Jev cannot summarize. What it can do, in one fast request per 40 turns, is mark each turn
+as something to carry forward word for word, to clip, or to drop. It judges a long turn on
+its first and last 350 characters, redacted, and sees no other turn while it does.
+
+What that is worth was measured (evals/compaction, seven real sessions, 104 questions):
+Jev's marks beat the same number of marks handed out by recency, 11 questions to 4, so the
+judgement is real. But a handoff written from the digest built on those marks recalled less
+than one written from the plain tail of the same size, 4 to 15. The clipping costs more
+than the judgement earns. Use `select` to choose turns when a budget forces a choice; do
+not expect it to improve a handoff, and see `handoff.recovery_block` for what did.
 """
 from __future__ import annotations
 
@@ -24,10 +29,12 @@ FATE = {
 
 
 def _text(message: Mapping[str, Any]) -> str:
-    content = message.get("content", "")
+    content = message.get("content")
     if isinstance(content, list):
         content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
-    return str(content)
+    # A tool-call-only assistant row has content None. str(None) is "None": four characters
+    # that were sent to Jev, paid for, judged, and then written into the digest as a turn.
+    return content if isinstance(content, str) else ("" if content is None else str(content))
 
 
 def select(
@@ -91,11 +98,18 @@ def digest(messages: Sequence[Mapping[str, Any]], selection: Mapping[str, Any], 
     return text if len(text) <= limit else text[-limit:]
 
 
-# The five headings a handoff needs. More than this and the next session reads an essay
-# instead of getting to work; fewer and it starts by rediscovering what was already decided.
+# The five headings a handoff needs. Fewer and the next session starts by rediscovering what
+# was already decided.
 HANDOFF_SECTIONS = ("Working on", "State", "Decisions", "Pointers", "Next")
 
-HANDOFF_PROMPT = """Write a handoff so a fresh session can pick this work up cold.
+# The budget was 400 words, on the theory that anything longer reads like an essay. Measured
+# (evals/compaction): with the writer reading the whole dialogue, 1,200 words answered 58.7%
+# of a recall exam closed-book against 46.2% at 400, 16 questions won and 3 lost. The writer
+# used about 820 of them. A confidential capsule stays at 400: it is a breadcrumb on purpose.
+HANDOFF_WORDS = 1200
+CONFIDENTIAL_WORDS = 400
+
+_PROMPT = """Write a handoff so a fresh session can pick this work up cold.
 
 Use exactly these five headings, in this order, nothing before or after:
 ## Working on
@@ -105,16 +119,26 @@ Use exactly these five headings, in this order, nothing before or after:
 ## Next
 
 Rules:
-- Under 400 words total.
-- Every line marked [KEEP VERBATIM] carries a decision, a constraint, an exact value, a path,
-  an id, a command or an error. Carry those through UNCHANGED. Do not paraphrase them.
-- [background] lines only need their gist, at most a sentence or two of context.
-- Pointers means exact paths, ids, URLs, ports, branch names, commands. No prose there.
+- Under {words} words total.
+{carry}- Pointers means exact paths, ids, URLs, ports, branch names, commands. No prose there.
 - Next means what the following session should actually do first, concretely.
 - Write nothing you cannot support from the transcript below. No guessing, no filler,
   no "the user seems to want". If something is unknown, say it is unknown.
 - Plain sentences. No bullets inside a section unless listing pointers.
 """
+
+_CARRY_MARKED = (
+    "- Every line marked [KEEP VERBATIM] carries a decision, a constraint, an exact value, a path,\n"
+    "  an id, a command or an error. Carry those through UNCHANGED. Do not paraphrase them.\n"
+    "- [background] lines only need their gist, at most a sentence or two of context.\n")
+# With no marks there is nothing to tell the writer about marks. This is the wording the
+# eval's winning arm used, so what ships is what was measured.
+_CARRY_PLAIN = (
+    "- Carry every decision, constraint, exact value, path, id, command and error string through\n"
+    "  UNCHANGED. Do not paraphrase them.\n")
+
+HANDOFF_PROMPT = _PROMPT.format(words=HANDOFF_WORDS, carry=_CARRY_MARKED)
+
 
 
 CONFIDENTIAL_RULES = """
@@ -157,9 +181,18 @@ def redact_capsule(text: str, limit: int = 6000) -> str:
 _GUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
 
 
-def handoff_prompt(digest_text: str, previous: str = "", *, confidential: bool = False) -> str:
-    """The full prompt for whatever text model writes the capsule. Jev cannot write it."""
-    prompt = HANDOFF_PROMPT + (CONFIDENTIAL_RULES if confidential else "")
+def handoff_prompt(digest_text: str, previous: str = "", *, confidential: bool = False,
+                   marked: bool = True, words: Optional[int] = None) -> str:
+    """The full prompt for whatever text model writes the capsule. Jev cannot write it.
+
+    ``marked`` says whether ``digest_text`` carries [KEEP VERBATIM] / [background] tags. A
+    plain transcript must be sent with ``marked=False``: the marked prompt tells the writer
+    that untagged-looking background "only needs its gist", which is the wrong thing to say
+    about a transcript nobody has filtered.
+    """
+    budget = int(words) if words else (CONFIDENTIAL_WORDS if confidential else HANDOFF_WORDS)
+    prompt = _PROMPT.format(words=max(100, budget), carry=_CARRY_MARKED if marked else _CARRY_PLAIN)
+    prompt += CONFIDENTIAL_RULES if confidential else ""
     if previous.strip():
         # Under confidentiality this sentence used to end "Do not lose identifiers" - appended
         # AFTER the rules that forbid carrying them, so the last instruction the writer read
@@ -170,8 +203,9 @@ def handoff_prompt(digest_text: str, previous: str = "", *, confidential: bool =
                 "they forbid, do NOT carry it forward.")
         prompt += ("\nA PREVIOUS handoff for this same work is below. Carry forward anything still "
                    "true, especially Pointers, and fold in what has happened since. " + keep +
-                   "\n\n<previous_handoff>\n" + previous.strip()[-6000:] + "\n</previous_handoff>\n")
-    return prompt + "\n\nTRANSCRIPT (already filtered; read the markers):\n\n" + digest_text + "\n"
+                   "\n\n<previous_handoff>\n" + previous.strip()[-12000:] + "\n</previous_handoff>\n")
+    label = "TRANSCRIPT (already filtered; read the markers)" if marked else "TRANSCRIPT"
+    return prompt + "\n\n" + label + ":\n\n" + digest_text + "\n"
 
 
 def looks_like_capsule(text: str) -> bool:

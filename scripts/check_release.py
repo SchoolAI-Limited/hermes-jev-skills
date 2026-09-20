@@ -35,9 +35,15 @@ if _DENY_FILE.is_file():
              if l.strip() and not l.startswith("#")]
 
 problems = []
+unscanned = []
 for name in files:
     path = ROOT / name
-    if not path.is_file() or path.suffix in {".png", ".jpg", ".gif", ".mp4"}:
+    if not path.is_file():
+        continue
+    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".pdf"}:
+        # "clean" used to cover these silently. A screenshot is where a real profile name
+        # or a path is most likely to ship, and no text pattern can see inside one.
+        unscanned.append(name)
         continue
     text = path.read_text(encoding="utf-8", errors="replace")
     for label, pattern in PATTERNS.items():
@@ -50,5 +56,7 @@ for name in files:
         if entry in lowered:
             # Name the file and the rule, never the string: this output lands in CI logs.
             problems.append(f"{name}: contains an entry from the release denylist (#{_DENY.index(entry) + 1})")
-print("\n".join(problems) if problems else f"clean: {len(files)} files")
+if unscanned:
+    print(f"NOT SCANNED ({len(unscanned)} binary): {', '.join(unscanned)} - look at these by eye before pushing")
+print("\n".join(problems) if problems else f"clean: {len(files) - len(unscanned)} text files")
 sys.exit(1 if problems else 0)

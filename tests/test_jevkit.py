@@ -1538,34 +1538,242 @@ class ConfidenceFloorTests(unittest.TestCase):
 
 
 class AskQuestionShapeTests(unittest.TestCase):
-    """`jev ask` is the raw escape hatch, and its help text says "{state, questions}".
-    A list of question objects (the shape every other Jev surface writes) used to crash
-    with AttributeError: 'list' object has no attribute 'items'."""
+    """`jev ask` is the raw escape hatch, and it failed on the shape its own help advertised.
 
-    def _run(self, payload):
+    The help said questions were a list of {id, kind, text}. The wire format says type,
+    instructions and criteria, so that shape went out verbatim and the reply check died on
+    question["type"] with a KeyError. The test that should have caught it mocked client.ask
+    away and pinned the wrong contract. Everything here goes through the real client.ask and
+    a fake transport, so what is asserted is what would have gone on the wire.
+    """
+
+    STATE = "The deploy failed twice on the same migration step."
+    NEXT = {"retry": "Run the same step again", "escalate": "Hand it to a person"}
+    LEVELS = ["Cosmetic", "Degraded", "Down"]
+
+    def _run(self, stdin, transport=None, raw=None, timeout="1"):
+        """Run `jev ask` on stdin. Returns (exit code, the JSON it printed, what reached the wire).
+
+        raw is stdin exactly as typed, a str or bytes, for what json.dumps would never write.
+        """
         import contextlib
         import io
-        from types import SimpleNamespace
         from jevkit import cli
-        args = SimpleNamespace(timeout=1.0)
-        with mock.patch.object(cli.client, "ask", return_value={"answers": {}, "usage": {}}) as ask:
-            with mock.patch.object(cli, "_stdin_json", return_value=payload):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    code = cli.cmd_ask(args)
-        return code, ask.call_args[0][1]
+        transport = transport or fake(choice_of(lambda name, question: next(iter(question["criteria"]))))
+        out = io.StringIO()
+        typed = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8") if isinstance(raw, bytes) else \
+            io.StringIO(json.dumps(stdin) if raw is None else raw)
+        with mock.patch.object(client, "_http_transport", transport), \
+                mock.patch.object(sys, "stdin", typed), contextlib.redirect_stdout(out):
+            code = cli.main(["ask", "--timeout", timeout])
+        return code, json.loads(out.getvalue()), getattr(transport, "calls", [])
 
-    def test_a_list_of_questions_becomes_a_named_mapping(self):
-        code, questions = self._run({
-            "state": {"task": "x"},
-            "questions": [{"id": "q1", "kind": "score", "text": "hard?"},
-                          {"kind": "choice", "text": "which?"}],
-        })
-        self.assertEqual(code, 0)
-        self.assertEqual(list(questions), ["q1", "q2"])
-        self.assertNotIn("id", questions["q1"])
-        self.assertEqual(questions["q1"]["kind"], "score")
+    def _refused(self, stdin, *named, **how):
+        """Bad input: exit 2, the JSON error contract, a detail naming the problem, nothing sent."""
+        code, printed, calls = self._run(stdin, **how)
+        self.assertEqual(code, 2)
+        self.assertEqual(printed["error"], "invalid_request")
+        for word in named:
+            self.assertIn(word, printed["detail"])
+        self.assertEqual(calls, [], "a request that was refused must never reach Jev")
+        return printed["detail"]
 
-    def test_a_mapping_of_questions_is_still_passed_through(self):
-        code, questions = self._run({"state": {"task": "x"}, "questions": {"q1": {"kind": "score"}}})
+    def test_a_list_of_questions_goes_on_the_wire_keyed_by_id_in_jevs_own_vocabulary(self):
+        code, printed, calls = self._run({"state": self.STATE, "questions": [
+            {"id": "blocked", "type": "noul", "instructions": "A person has to step in"},
+            {"id": "next", "type": "choice", "instructions": "What next?", "criteria": self.NEXT},
+            {"id": "severity", "type": "score", "instructions": "How serious?", "criteria": self.LEVELS}]})
         self.assertEqual(code, 0)
-        self.assertEqual(list(questions), ["q1"])
+        self.assertEqual(calls[0]["request"]["state"], self.STATE)
+        self.assertEqual(calls[0]["request"]["questions"], {
+            "blocked": {"type": "noul", "instructions": "A person has to step in"},
+            "next": {"type": "choice", "instructions": "What next?", "criteria": self.NEXT},
+            "severity": {"type": "score", "instructions": "How serious?", "criteria": self.LEVELS}})
+        self.assertEqual(printed["answers"]["next"]["choice"], "retry")
+        self.assertEqual(set(printed["answers"]), {"blocked", "next", "severity"})
+
+    def test_kind_and_text_are_translated_to_type_and_instructions_before_anything_is_sent(self):
+        """The 0.13.2 shape. It used to be sent as written, and Jev has no "kind" or "text"."""
+        code, printed, calls = self._run({"state": self.STATE, "questions": [
+            {"id": "severity", "kind": "score", "text": "How serious?", "criteria": self.LEVELS},
+            {"kind": "noul", "text": "A person has to step in"}]})
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0]["request"]["questions"], {
+            "severity": {"type": "score", "instructions": "How serious?", "criteria": self.LEVELS},
+            "q2": {"type": "noul", "instructions": "A person has to step in"}})
+        self.assertEqual(printed["answers"]["q2"]["type"], "noul")
+
+    def test_a_mapping_of_questions_is_sent_under_the_names_it_was_given(self):
+        code, _, calls = self._run({"state": {"task": "x"}, "questions": {
+            "next": {"type": "choice", "instructions": "What next?", "criteria": self.NEXT},
+            "blocked": {"kind": "noul", "text": "A person has to step in"}}})
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0]["request"]["questions"], {
+            "next": {"type": "choice", "instructions": "What next?", "criteria": self.NEXT},
+            "blocked": {"type": "noul", "instructions": "A person has to step in"}})
+
+    def test_the_example_in_the_help_text_is_a_request_that_works(self):
+        """The help is where the broken shape came from, so the example in it is run, not trusted."""
+        from jevkit import cli
+        subparsers = next(a for a in cli.build_parser()._actions if isinstance(getattr(a, "choices", None), dict))
+        described = subparsers.choices["ask"].description
+        example, _ = json.JSONDecoder().raw_decode(described, described.index("{"))
+        code, printed, calls = self._run(example)
+        self.assertEqual(code, 0, printed)
+        sent = calls[0]["request"]["questions"]
+        self.assertEqual({q["type"] for q in sent.values()}, {"choice", "score", "noul"},
+                         "the example should show every kind of question")
+        self.assertEqual(set(printed["answers"]), set(sent))
+
+    def test_a_choice_or_score_without_criteria_is_refused_and_never_sent(self):
+        """{id, kind, text} has no slot for criteria, and the reply check read question["criteria"]."""
+        for kind in ("choice", "score"):
+            detail = self._refused({"state": self.STATE, "questions": [{"id": "q", "kind": kind, "text": "which?"}]},
+                                   "criteria are required", kind)
+            self.assertIn('"q"', detail)
+
+    def test_criteria_of_the_wrong_shape_are_refused(self):
+        """dict() over a list of two-letter options quietly built a mapping nobody wrote."""
+        for kind, criteria in (("choice", ["ab", "cd"]), ("choice", {"only": "one option"}), ("choice", {}),
+                               ("score", {"low": "x", "high": "y"}), ("score", ["one level"]), ("score", "high")):
+            self._refused({"state": self.STATE, "questions": {"q": {
+                "type": kind, "instructions": "which?", "criteria": criteria}}}, "criteria", kind)
+
+    def test_an_id_of_zero_names_the_question_zero(self):
+        """`id or "q1"` read 0 as no id at all and renamed the question."""
+        code, printed, calls = self._run({"state": self.STATE, "questions": [
+            {"id": 0, "type": "noul", "instructions": "A person has to step in"}]})
+        self.assertEqual(code, 0)
+        self.assertEqual(list(calls[0]["request"]["questions"]), ["0"])
+        self.assertEqual(list(printed["answers"]), ["0"])
+
+    def test_duplicate_ids_are_refused_instead_of_silently_dropping_a_question(self):
+        """The later question overwrote the earlier one, which was never asked and never reported."""
+        question = {"type": "noul", "instructions": "A person has to step in"}
+        self._refused({"state": self.STATE, "questions": [dict(question, id="a"), dict(question, id="a")]},
+                      '"a"', "unique")
+        self._refused({"state": self.STATE, "questions": [dict(question, id=0), dict(question, id="0")]}, '"0"')
+        # The second question has no id, so it is named q2 by position: the same collision.
+        self._refused({"state": self.STATE, "questions": [dict(question, id="q2"), question]}, '"q2"')
+
+    def test_an_id_that_is_not_a_string_or_a_number_is_refused(self):
+        for ident in (["a"], {"a": 1}, True, 1.5):
+            self._refused({"state": self.STATE, "questions": [
+                {"id": ident, "type": "noul", "instructions": "x"}]}, "question 1", "id")
+
+    def test_a_request_that_is_not_an_object_is_refused(self):
+        for request in ([{"type": "noul", "instructions": "x"}], "is it done?", 7, None):
+            self._refused(request, "JSON object")
+
+    def test_a_request_with_no_state_is_refused(self):
+        """request["state"] was a KeyError and a traceback."""
+        questions = [{"type": "noul", "instructions": "x"}]
+        self._refused({"questions": questions}, '"state"')
+        self._refused({"state": None, "questions": questions}, '"state"')
+
+    def test_a_request_with_no_questions_is_refused(self):
+        """request["questions"] was a KeyError and a traceback."""
+        self._refused({"state": self.STATE}, '"questions"')
+
+    def test_an_empty_list_or_mapping_of_questions_is_refused(self):
+        """client.ask raises a bare ValueError("no questions"), which nothing caught."""
+        for empty in ([], {}):
+            self._refused({"state": self.STATE, "questions": empty}, "empty")
+
+    def test_a_question_that_is_not_an_object_is_refused(self):
+        """Non-dict items were filtered out, so a list of strings became "no questions" and a traceback."""
+        for item in ("is it done?", 3, None, ["noul", "is it done?"]):
+            self._refused({"state": self.STATE, "questions": [item]}, '"q1"', "object")
+        self._refused({"state": self.STATE, "questions": {"done": "is it done?"}}, '"done"', "object")
+
+    def test_questions_that_are_neither_a_list_nor_a_mapping_are_refused(self):
+        """A string reached questions.items() and died with AttributeError."""
+        for questions in ("is it done?", 7, True):
+            self._refused({"state": self.STATE, "questions": questions}, '"questions"', "list")
+
+    def test_an_unknown_or_missing_type_is_refused(self):
+        detail = self._refused({"state": self.STATE, "questions": [{"id": "q", "type": "rating", "instructions": "x"}]},
+                               "unknown type", "rating")
+        self.assertIn("choice, score, noul", detail)
+        self._refused({"state": self.STATE, "questions": [{"id": "q", "instructions": "x"}]}, "no type")
+        self._refused({"state": self.STATE, "questions": [{"id": "q", "type": ["noul"], "instructions": "x"}]},
+                      "unknown type")
+
+    def test_a_question_with_no_instructions_is_refused(self):
+        for question in ({"type": "noul"}, {"type": "noul", "instructions": "  "}, {"type": "noul", "text": 5}):
+            self._refused({"state": self.STATE, "questions": [question]}, "instructions")
+
+    def test_type_and_kind_that_disagree_are_refused_rather_than_one_of_them_winning(self):
+        self._refused({"state": self.STATE, "questions": [
+            {"type": "noul", "kind": "score", "instructions": "x"}]}, '"type"', '"kind"', "disagree")
+        code, _, calls = self._run({"state": self.STATE, "questions": [
+            {"type": "noul", "kind": "noul", "instructions": "x", "text": "x"}]})
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0]["request"]["questions"], {"q1": {"type": "noul", "instructions": "x"}})
+
+    def test_a_name_written_twice_in_the_mapping_form_is_refused_instead_of_dropping_a_question(self):
+        """json.loads keeps the last of two equal keys, so the {name: question} form still had
+        the duplicate-id bug: the first "a" was never asked and never reported."""
+        self._refused(None, '"a"', "twice", raw='{"state": "s", "questions": {'
+                      '"a": {"type": "noul", "instructions": "one"}, "a": {"type": "noul", "instructions": "two"}}}')
+        # The same silence dropped an option out of a choice.
+        self._refused(None, '"retry"', "twice", raw='{"state": "s", "questions": [{"type": "choice", '
+                      '"instructions": "What next?", "criteria": {"retry": "x", "retry": "y", "stop": "z"}}]}')
+
+    def test_stdin_that_cannot_be_read_as_json_is_refused_like_any_other_bad_input(self):
+        """Only a JSONDecodeError was turned into a message. Bytes that are not UTF-8 and
+        nesting past the recursion limit came out as tracebacks, and the help promises JSON."""
+        self._refused(None, "not valid JSON", raw="")
+        self._refused(None, "not valid JSON", raw='{"state": "s", "questions": [')
+        self._refused(None, "UTF-8", raw=b'{"state": "\xff\xfe", "questions": []}')
+        # 3.9 to 3.12 give up reading this. 3.14 reads it, and then the state is too large to send.
+        code, printed, calls = self._run(None, raw='{"state": ' + "[" * 100000 + "]" * 100000
+                                         + ', "questions": [{"type": "noul", "instructions": "x"}]}')
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn(printed.get("detail", printed["error"]), ("stdin is nested too deeply to read", "state_too_large"))
+
+    def test_a_state_nested_just_deeply_enough_to_overflow_the_encoder_is_refused(self):
+        """A few levels short of what json.loads refuses, the state was read fine and then
+        json.dumps inside client.ask, deeper in the stack, raised RecursionError as a traceback."""
+        def overflow(body, headers, timeout):
+            raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+
+        code, printed, _ = self._run({"state": self.STATE, "questions": [{"type": "noul", "instructions": "x"}]},
+                                     transport=overflow)
+        self.assertEqual((code, printed["error"]), (2, "invalid_request"))
+        self.assertIn("nested too deeply", printed["detail"])
+        # The real thing, wherever the window falls on this interpreter: never a traceback.
+        for depth in range(900, 1100, 3):
+            code, printed, _ = self._run(None, raw='{"state": ' + "[" * depth + "]" * depth
+                                         + ', "questions": [{"type": "noul", "instructions": "x"}]}')
+            self.assertIn(code, (0, 2), printed)
+
+    def test_a_timeout_the_socket_would_choke_on_is_refused(self):
+        """nan reached socket.settimeout as a ValueError and inf as an OverflowError, both tracebacks."""
+        request = {"state": self.STATE, "questions": [{"type": "noul", "instructions": "x"}]}
+        for timeout in ("nan", "inf", "1e300"):
+            self._refused(request, "--timeout", timeout=timeout)
+        code, printed, calls = self._run(request, timeout="0")
+        self.assertEqual((code, printed, calls), (2, {"error": "timeout"}, []))
+
+    def test_a_refusal_does_not_quote_a_huge_id_or_type_back_in_full(self):
+        """A 1 MB type came back as a 1 MB error with the complaint at the far end of it."""
+        question = {"type": "noul", "instructions": "x"}
+        for questions, named in (([{"type": "B" * 500_000, "instructions": "x"}], "unknown type"),
+                                 ([dict(question, id="A" * 500_000), dict(question, id="A" * 500_000)], "unique"),
+                                 ({"A" * 500_000: "is it done?"}, "object")):
+            detail = self._refused({"state": self.STATE, "questions": questions}, named)
+            self.assertLess(len(detail), 400)
+
+    def test_a_jev_failure_still_prints_its_code_and_exits_two(self):
+        def denied(body, headers, timeout):
+            raise client.JevError("auth_failed")
+
+        code, printed, _ = self._run({"state": self.STATE, "questions": [{"type": "noul", "instructions": "x"}]},
+                                     transport=denied)
+        self.assertEqual((code, printed), (2, {"error": "auth_failed"}))
+
+    def test_no_refusal_ever_prints_the_key(self):
+        code, printed, _ = self._run({"state": self.STATE, "questions": [{"kind": "choice", "text": KEY}]})
+        self.assertEqual(code, 2)
+        self.assertNotIn(KEY, json.dumps(printed))

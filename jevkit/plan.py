@@ -19,9 +19,14 @@ never mistaken for a plan.
 What leaves the machine: the command, the front app's name and the running app names, to
 the text model endpoint (OpenRouter unless TEXT_MODEL_BASE_URL says otherwise). A command
 that ``privacy.is_sensitive`` flags is not sent at all.
+
+What stays on it: the validated steps of a plan, in ``jevkit/memo.py``'s store, so the same
+command need not be planned twice (see "the plan cache" below). ``JEV_MEMO`` is ``off``,
+``shadow`` or ``on``, and shadow, which reuses nothing, is the default.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -34,7 +39,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
-from . import privacy
+from . import memo, privacy
 
 SCHEMA = "jev.plan_v1"
 KINDS = ("open_app", "open_url", "click", "type_text", "press_key", "menu", "scroll", "wait")
@@ -201,8 +206,13 @@ def resolve_credentials(env: Optional[Mapping[str, str]] = None,
             key = (find("OPENROUTER_API_KEY", env.get("USER") or os.environ.get("USER", "")) or "").strip()
         except Exception:  # noqa: BLE001 - an injected lookup gets the same promise
             key = ""
-    return {"key": key,
-            "model": env.get("JEV_PLAN_MODEL") or env.get("TEXT_MODEL") or DEFAULT_MODEL,
+    return dict(_endpoint(env), key=key)
+
+
+def _endpoint(env: Mapping[str, str]) -> Dict[str, str]:
+    """Which model, where. Split out because ``forget`` needs these to rebuild a cache key
+    and must not read a secret store to get them."""
+    return {"model": env.get("JEV_PLAN_MODEL") or env.get("TEXT_MODEL") or DEFAULT_MODEL,
             "base_url": (env.get("TEXT_MODEL_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")}
 
 
@@ -405,7 +415,11 @@ def _asked(command: str, steps: Sequence[Mapping[str, Any]]) -> str:
         if step.get("kind") == "type_text" and typed:
             # Once per step: "type send, then click Send" asks for the click in its own
             # words, and removing every occurrence would erase the request with the content.
-            asked = re.sub(re.escape(typed), " ", asked, count=1, flags=re.IGNORECASE)
+            # Whitespace-tolerant: a model tidies "please  send it" into "please send it", the
+            # exact match then misses, the dictated "send" stays in the command, and it reads
+            # as the person asking for a send.
+            pattern = r"\s+".join(re.escape(word) for word in typed.split())
+            asked = re.sub(pattern, " ", asked, count=1, flags=re.IGNORECASE)
     return asked
 
 
@@ -510,6 +524,121 @@ def parse_response(raw: bytes) -> List[Dict[str, Any]]:
     return [step for step in cleaned if step is not None]
 
 
+# ── the plan cache ───────────────────────────────────────────────────────────
+# The same spoken command produces the same plan, and asking for it again is a second of
+# waiting for something already on this machine. So a plan is remembered under exactly what
+# decides it. Two ideas here come from rohanarun/computer-use-cache (MIT licence,
+# https://github.com/rohanarun/computer-use-cache): the key names the endpoint an answer came
+# from, and any failure is a miss. No code does. That project caches whole model responses
+# behind a proxy; here a sensitive command returns before a key is ever computed, only
+# validated steps are kept, and they go through the never-send filter again on every read.
+
+CACHE_NAMESPACE = "plan"
+CACHE_TTL_S = 7 * 24 * 3600
+# Bump when the never-send rule changes what it keeps. Entries hold the steps from BEFORE
+# that filter, so an old entry is still filtered by the new rule; the bump is for the rarer
+# change that should also make the model be asked again.
+_NEVER_SEND_VERSION = "never_send_v1"
+
+
+def rules_version() -> str:
+    """16 hex digits that change whenever anything that shapes a plan changes.
+
+    Computed per call, not at import, because the prompt is what gets edited: an entry
+    written under the old prompt must stop matching the moment the new one is in force.
+    """
+    rules = (SYSTEM_PROMPT + json.dumps(_STEP_SCHEMA, sort_keys=True) + "|".join(KINDS)
+             + str(MAX_STEPS) + _NEVER_SEND_VERSION)
+    return hashlib.sha256(rules.encode("utf-8")).hexdigest()[:16]
+
+
+def cache_key(command: str, front_app: str = "", running_apps: Sequence[str] = (), *,
+              model: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL) -> str:
+    """The memo key for one command in one context. "" when it cannot be built.
+
+    The full running-apps list is deliberately NOT in the key. It arrives in z-order, which
+    changes every time a window is touched, so with it in the key no two runs would ever
+    match. Only an app the command NAMES can change a plan ("switch to Notes" opens it or
+    clicks it). The model still gets the whole list on a miss. The front app is in, because
+    "open a new window" means a different menu in a different app. There is no fingerprint
+    of the API key: the same model at the same host answers alike for every key, and a hash
+    of a credential is one more thing on disk that never needed to be there.
+    """
+    try:
+        folded = command.casefold()
+        named = sorted({a.casefold() for a in (str(x).strip() for x in running_apps)
+                        if a and a.casefold() in folded})
+        # The command goes in as given, not with its whitespace collapsed. Collapsed, "type
+        # please  send it" was answered with the plan kept for "type please send it", whose
+        # typed text no longer matched the command, so the never-send filter could not tell
+        # the dictated "send" from a request and kept a click on Send nobody asked for.
+        return memo.key(CACHE_NAMESPACE, command.strip(), front_app.strip().casefold(),
+                        ",".join(named), model, urlsplit(base_url).hostname or "", rules_version())
+    except Exception:  # noqa: BLE001 - an address urlsplit rejects costs the cache, never the plan
+        return ""
+
+
+def _cached_steps(key: str) -> Optional[List[Dict[str, Any]]]:
+    """Steps from the memo, validated again, or None. The file is not trusted.
+
+    It sits in a cache directory, and whatever can write there can write a step. Each one
+    goes back through ``clean_step``, so a kind outside the vocabulary, a ``file:`` address
+    or a ``risky`` mark someone added by hand does not survive, and one bad step rejects the
+    entry for the reason it rejects a fresh plan: the rest assumed it happened.
+    """
+    entry = memo.get(CACHE_NAMESPACE, key, CACHE_TTL_S) if key else None
+    if entry is None:
+        return None
+    try:
+        raw = entry.get("steps")
+        steps = [clean_step(step) for step in raw] if isinstance(raw, list) and 0 < len(raw) <= MAX_STEPS else [None]
+    except Exception:  # noqa: BLE001 - plan() never raised before it had a cache, and must not start now
+        steps = [None]
+    if any(step is None for step in steps):
+        memo.drop(CACHE_NAMESPACE, key)
+        return None
+    return [step for step in steps if step is not None]
+
+
+def _remember(key: str, steps: Sequence[Mapping[str, Any]]) -> None:
+    """Keep a plan, unless a step holds something that must not sit in a file.
+
+    The command was screened before it got here, but the model writes the steps and can
+    put in a step what the command only hinted at. The steps stored are the ones from
+    BEFORE the never-send filter, so that filter runs on every read under the rules in
+    force at that moment, not the rules of the day the entry was written.
+    """
+    try:
+        if not key or any(privacy.is_sensitive(str(step.get(field) or ""))
+                          for step in steps for field in ("target", "text")):
+            return
+        memo.put(CACHE_NAMESPACE, key, {"steps": [dict(step) for step in steps]}, ttl_s=CACHE_TTL_S)
+    except Exception:  # noqa: BLE001 - the plan is already made; failing to keep it costs the next run a call
+        return
+
+
+def forget(command: str, front_app: str = "", running_apps: Sequence[str] = (), *,
+           credentials: Optional[Mapping[str, str]] = None) -> None:
+    """Drop the cached plan for this command. For a caller whose run did not end well.
+
+    A plan that led to a failed step or an unverified end state may be the reason, and a
+    cache would otherwise serve it again for a week. Pass the same context ``plan`` was
+    given (and the same ``credentials``, if any were), or the key will not match. Never raises.
+    """
+    try:
+        if memo.mode() == "off" or not isinstance(command, str) or not command.strip():
+            return
+        if len(command) > MAX_COMMAND_CHARS or privacy.is_sensitive(command):
+            return          # never stored, so there is nothing to find, and it is never keyed
+        creds = dict(credentials) if credentials is not None else _endpoint(os.environ)
+        key = cache_key(command, front_app, running_apps, model=creds.get("model") or DEFAULT_MODEL,
+                        base_url=(creds.get("base_url") or DEFAULT_BASE_URL).rstrip("/"))
+        if key:
+            memo.drop(CACHE_NAMESPACE, key)
+    except Exception:  # noqa: BLE001 - forgetting is a courtesy; the caller is already handling a failure
+        return
+
+
 # ── public call ──────────────────────────────────────────────────────────────
 
 def plan(command: str, *, front_app: str = "", running_apps: Sequence[str] = (),
@@ -518,15 +647,24 @@ def plan(command: str, *, front_app: str = "", running_apps: Sequence[str] = (),
     """Plan ``command``. Never raises for a planner failure; returns the goal step instead.
 
     Returns ``{"schema", "status", "reason", "steps", "dropped", "latency_ms", "model",
-    "usage"}``. ``status`` is ``planned`` or ``fallback``; on ``fallback`` the single step
-    is ``{"kind": "goal", "text": command}``.
+    "usage", "cache"}``. ``status`` is ``planned`` or ``fallback``; on ``fallback`` the single
+    step is ``{"kind": "goal", "text": command}``.
+
+    ``cache`` says what the plan cache did. ``off``: JEV_MEMO=off, nothing read or written.
+    ``miss``: the model was asked and no stored plan was involved. ``hit``: the steps came
+    from the cache and no call was made (JEV_MEMO=on only). ``shadow_agree`` and
+    ``shadow_differ``: the model was asked anyway, a stored plan existed, and the two did
+    or did not match (the default mode, which never reuses anything).
     """
     started = time.monotonic()
     command = command if isinstance(command, str) else ""
+    mode = memo.mode()
+    cache = "off" if mode == "off" else "miss"
 
     def result(status: str, steps: List[Dict[str, Any]], reason: str = "", **extra: Any) -> Dict[str, Any]:
         out = {"schema": SCHEMA, "status": status, "reason": reason, "steps": steps, "dropped": [],
-               "latency_ms": int((time.monotonic() - started) * 1000), "model": "", "usage": {}}
+               "latency_ms": int((time.monotonic() - started) * 1000), "model": "", "usage": {},
+               "cache": cache}
         out.update(extra)
         return out
 
@@ -545,6 +683,20 @@ def plan(command: str, *, front_app: str = "", running_apps: Sequence[str] = (),
         return fallback("no_key")
     model = creds.get("model") or DEFAULT_MODEL
     base_url = (creds.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    # The cache comes after every check above on purpose. A sensitive command has already
+    # returned, so it is never hashed into a key, let alone stored; and a machine with no
+    # text-model key behaves exactly as it did before there was a cache.
+    memo_key = "" if mode == "off" else cache_key(command, front_app, running_apps, model=model, base_url=base_url)
+    cached = _cached_steps(memo_key)
+    if cached is not None and mode == "on":
+        cache = "hit"
+        kept, dropped = enforce_never_send(command, cached)
+        if not kept:
+            # Nothing in it survives today's rules, so it would only ever be a slower way
+            # to say "fallback". Drop it and let the next run ask the model again.
+            memo.drop(CACHE_NAMESPACE, memo_key)
+            return fallback("nothing_safe_planned", model=model, dropped=dropped)
+        return result("planned", kept, model=model, dropped=dropped)
     body = json.dumps(build_request(command, front_app, running_apps, model=model, base_url=base_url),
                       separators=(",", ":")).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
@@ -566,8 +718,16 @@ def plan(command: str, *, front_app: str = "", running_apps: Sequence[str] = (),
                      if isinstance(reported.get(k), (int, float))}
     except (ValueError, AttributeError):
         pass
+    if cached is not None:
+        # Only reachable in shadow mode: the entry was read, the model was asked anyway, and
+        # this is the evidence for whether turning the cache on would have changed anything.
+        cache = "shadow_agree" if steps == cached else "shadow_differ"
     if not kept:
         return fallback("nothing_safe_planned", model=model, dropped=dropped, usage=usage)
+    # Stored only now, when the fresh call has ended as a plan someone can run. A fallback
+    # is never stored: it would turn one outage into a week of them.
+    if cached is None or steps != cached:
+        _remember(memo_key, steps)
     return result("planned", kept, model=model, dropped=dropped, usage=usage)
 
 

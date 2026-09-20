@@ -29,8 +29,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 TRIGGERS = frozenset({"handoff", "hand off", "hand-off"})
-TRANSCRIPT_CHARS = 24_000
-CAPSULE_MAX_CHARS = 6_000
+# The writer used to see the last 24,000 characters and answer in 400 words. Measured
+# (evals/compaction, 104 questions): the whole dialogue with a 1,200-word budget recalled
+# 58.7% closed-book against 48.1% for that, and 75.0% against 68.3% with one search. The
+# longest of those sessions was 118,000 characters of dialogue, about a cent to read.
+TRANSCRIPT_CHARS = 300_000
+CAPSULE_MAX_CHARS = 12_000
+# Jev judges 40 turns per request, one request after another. A 600-turn lane was 15
+# sequential calls of up to 8 s before the writer even started. The compaction hook has
+# always capped this; the plugin never did.
+MAX_JUDGED_TURNS = 240
 # An 800-message session exports in about half a second. Thirty seconds is a wedged CLI,
 # not a slow one, and nothing should wait two minutes to find that out.
 EXPORT_TIMEOUT = 30
@@ -343,14 +351,17 @@ def build(
     # A Jev outage still writes one, from an unfiltered transcript, and whoever reads the
     # report has to be able to tell that night from a good one.
     jev_calls, counts, jev, jev_errors = 0, {}, "not_used", []
+    marked = False                  # does `body` carry [KEEP VERBATIM] / [background] tags?
     if select and digest:
         try:
-            selection = select(messages, keep_last=8)
+            recent = messages[-MAX_JUDGED_TURNS:]
+            selection = select(recent, keep_last=8)
             counts = selection.get("counts") or {}
             jev_calls = selection.get("jev_calls") or 0
             jev = str(selection.get("status") or "ok")
             jev_errors = list(selection.get("errors") or [])
-            body = digest(messages, selection, TRANSCRIPT_CHARS)
+            body = digest(recent, selection, TRANSCRIPT_CHARS)
+            marked = True
         except Exception as error:  # noqa: BLE001
             jev, jev_errors = "error", [type(error).__name__]
             body = _plain(messages)
@@ -364,12 +375,20 @@ def build(
             previous = existing.read_text(encoding="utf-8")
         except OSError:
             previous = ""
+        # The old Recovery block names the OLD session. Left in, the writer copies it into
+        # the new capsule, and the note ends with two blocks pointing at different sessions.
+        previous = previous.split("\n## Recovery", 1)[0]
 
     capsule = ""
     try:
         if prompt_for:
             try:
-                prompt = prompt_for(body, previous, confidential=confidential)
+                try:
+                    prompt = prompt_for(body, previous, confidential=confidential, marked=marked)
+                except TypeError:
+                    # A jevkit from before `marked`. Its prompt talks about markers that a
+                    # plain transcript does not have, which is untidy but not unsafe.
+                    prompt = prompt_for(body, previous, confidential=confidential)
             except TypeError:
                 # An older jevkit has no confidentiality mode. This used to carry on when a
                 # scrubber was supplied and still report "ok", on the theory that the regex
@@ -413,7 +432,11 @@ def build(
             if confidential:
                 return {"status": "scrub_failed"}
 
-    capsule = capsule[:CAPSULE_MAX_CHARS]
+    capsule = _fit(capsule, CAPSULE_MAX_CHARS)
+    if not confidential:
+        # A confidential lane carries a breadcrumb on purpose, and a list of file names and
+        # ids is exactly what its contract forbids. Everyone else gets the way back.
+        capsule += "\n\n" + recovery_block(session_id, messages)
     stamp = time.strftime("%Y-%m-%d %H:%M %Z")
     text = f"# Handoff — {stamp}\n\n{capsule}\n"
     try:
@@ -427,8 +450,71 @@ def build(
             "chars": len(text)}
 
 
+def jev_prepass_enabled() -> bool:
+    """Whether Jev marks the turns before the writer sees them. Off unless asked for.
+
+    It used to be on whenever a key was present, on the belief that a handoff written from
+    Jev's keep / summarize / drop digest "stops losing the one line that mattered". Measured
+    on seven real sessions and 104 exam questions (evals/compaction), a capsule written
+    from that digest answered 37.5% closed-book against 48.1% for one written from the
+    plain tail of the same size: 4 wins, 15 losses question by question. With one search of
+    the old session allowed they tied. Jev's marks did beat the same marks assigned by
+    recency (11 wins to 4), so the judgement is real; it was the digest built around it
+    that cost more than the judgement earned.
+
+    So the default is the path that measured best, is free, adds no latency and sends
+    nothing anywhere. ``HANDOFF_JEV=1`` turns the pre-pass back on.
+    """
+    return os.environ.get("HANDOFF_JEV", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fit(capsule: str, limit: int) -> str:
+    """Trim an over-long capsule from the middle, never from the end.
+
+    The headings run Working on, State, Decisions, Pointers, Next. A plain ``[:limit]``
+    cut therefore removed Pointers and Next first: the exact paths and the first thing to
+    do, which are the two sections the next session cannot reconstruct.
+    """
+    if len(capsule) <= limit:
+        return capsule
+    at = capsule.find("## Pointers")
+    tail = capsule[at:] if at > 0 else ""
+    if not tail or len(tail) > limit * 0.6:
+        return capsule[:limit]
+    note = "\n[… trimmed to fit …]\n\n"
+    return capsule[:max(0, limit - len(tail) - len(note))].rstrip() + note + tail
+
+
+def recovery_block(session_id: str, messages: List[Dict[str, str]]) -> str:
+    """How the next session gets back to what this note left out. No model writes this.
+
+    A capsule cannot hold a working session, and measuring it says so: on seven real
+    sessions the best capsule answered 59% of a recall exam alone and 75% with one search
+    of the old session, and a session with NO capsule and one search answered 57%
+    (evals/compaction; Nous Research found the same shape, 43% to 79%, in hermes-agent PR
+    116246). This capsule used to carry no session id and never said a search exists, so
+    the one mechanism shown to work was out of reach of whoever read it.
+
+    The call shapes are spelled out because the obvious one is wrong: passing ``query``
+    together with ``session_id`` reads the session from the top and ignores the query.
+
+    A list of the identifiers the session used was tried here too. It changed nothing with
+    a capsule and cost 13 points without one, so it is not here.
+    """
+    return "\n".join([
+        "## Recovery",
+        f"This note summarises session `{session_id}` ({len(messages)} messages). The full session is still "
+        "searchable, and looking a value up is cheaper than guessing it or asking the person again.",
+        '- Find it: `session_search(query="2 to 5 keywords")`. Each result carries a `session_id` and a '
+        "`match_message_id`.",
+        f'- Read around a hit: `session_search(session_id="{session_id}", around_message_id=<match_message_id>)`.',
+        '- Output from commands and files is not searched by default. Add `role_filter="user,assistant,tool"` '
+        "when the value came from one."])
+
+
 def _plain(messages: List[Dict[str, str]]) -> str:
-    joined = "\n\n".join(f"[background] {m['role']}: {m['content']}" for m in messages)
+    # No tags: nothing marked these lines, and the prompt is told so (marked=False).
+    joined = "\n\n".join(f"{m['role']}: {m['content']}" for m in messages)
     return joined[-TRANSCRIPT_CHARS:]
 
 

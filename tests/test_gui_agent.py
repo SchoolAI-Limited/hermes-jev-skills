@@ -5,11 +5,31 @@ Every test here is a bug that was live in a released version, not a hypothetical
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
+
+_CACHE_HOME = tempfile.TemporaryDirectory()
+_ENV = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": _CACHE_HOME.name})
+
+
+def setUpModule():
+    """A --plan run that fails a step now forgets its plan, which writes to the plan cache.
+    No test here may do that to the cache of whoever runs the suite, or behave differently
+    because their shell exports JEV_MEMO."""
+    _ENV.start()
+    os.environ.pop("JEV_MEMO", None)
+
+
+def tearDownModule():
+    _ENV.stop()
+    _CACHE_HOME.cleanup()
+
 _spec = importlib.util.spec_from_file_location(
     "jev_gui_agent", REPO / "skills" / "jev-computer-use" / "scripts" / "jev_gui_agent.py")
 gui = importlib.util.module_from_spec(_spec)
@@ -723,3 +743,169 @@ class PlannedStepOutcomeTests(unittest.TestCase):
         self.assertEqual(gui._brief(refused), {"effect": "refused", "message": "window_id does not belong to pid"})
         self.assertEqual(gui._brief({"result": {"structuredContent": {"effect": "confirmed"}}}),
                          {"effect": "confirmed", "message": ""})
+
+
+class TextHelperTests(unittest.TestCase):
+    """``--values`` is the whole of what may be typed. The text model only picks from it."""
+
+    def ask(self, values, answer=None, env=None):
+        """text_helper with a key present and the network replaced by ``answer``."""
+        body = json.dumps({"choices": [{"message": {"content": answer}}]}).encode()
+        opened = mock.Mock(side_effect=lambda request, timeout=None: io.BytesIO(body))
+        with mock.patch.dict(os.environ, FAKE_KEYS if env is None else env), \
+                mock.patch.object(gui.urllib.request, "urlopen", opened):
+            chosen = gui.text_helper("Sign the guest book", "Name", values)
+        return chosen, opened
+
+    def test_one_allowed_value_is_typed_without_asking_a_model(self):
+        """It asked a model to "choose the best one" from a list of one: a network call
+        with a 30 second timeout, mid-step, for an answer that was never in doubt."""
+        chosen, opened = self.ask(["Jane Doe"], answer='{"text": "Someone Else"}')
+        self.assertEqual(chosen, "Jane Doe")
+        opened.assert_not_called()
+
+    def test_a_reply_that_is_not_an_allowed_value_is_never_typed(self):
+        """The reply was typed as it came. A model that answered with anything else put
+        text the person never allowed into a field on their screen."""
+        for reply in ('{"text": "Jane Doe; DROP TABLE guests"}', '{"text": "jane doe"}', '{"text": ""}',
+                      '{"text": ["Jane Doe"]}', '["Jane Doe"]', "Jane Doe", "null", "{broken"):
+            with self.subTest(reply=reply):
+                chosen, opened = self.ask(["Jane Doe", "J. Doe"], answer=reply)
+                self.assertEqual(chosen, "Jane Doe")
+                opened.assert_called_once()              # the model WAS asked; its answer was refused
+
+    def test_a_reply_that_is_an_allowed_value_is_used(self):
+        """The control for the test above: without it, a helper that ignored the model
+        altogether would pass."""
+        for reply in ('{"text": "J. Doe"}', '```json\n{"text": "J. Doe"}\n```', '{"text": "  J. Doe "}'):
+            with self.subTest(reply=reply):
+                self.assertEqual(self.ask(["Jane Doe", "J. Doe"], answer=reply)[0], "J. Doe")
+
+    def test_no_key_or_no_values_still_makes_no_call(self):
+        chosen, opened = self.ask(["Jane Doe", "J. Doe"], env={"TEXT_MODEL_API_KEY": "", "OPENROUTER_API_KEY": ""})
+        self.assertEqual(chosen, "Jane Doe")
+        self.assertEqual(self.ask([])[0], "")
+        opened.assert_not_called()
+
+    def test_a_network_failure_types_the_first_value_not_a_traceback(self):
+        for failure in (OSError("connection reset"), TimeoutError("timed out"), ValueError("unknown url type")):
+            with self.subTest(failure=failure), mock.patch.dict(os.environ, FAKE_KEYS), \
+                    mock.patch.object(gui.urllib.request, "urlopen", side_effect=failure):
+                self.assertEqual(gui.text_helper("Sign the guest book", "Name", ["Jane Doe", "J. Doe"]), "Jane Doe")
+
+
+@unittest.skipIf(gui.jev_plan is None, "jevkit.plan is not importable here")
+class PlanCacheRunnerTests(unittest.TestCase):
+    """A cached plan is served for a week, so a run that went wrong must not leave one behind."""
+
+    GOAL = "Open System Settings and press escape"
+    STEPS = [{"kind": "open_app", "target": "System Settings"}, {"kind": "press_key", "target": "escape"}]
+
+    def main(self, expect, driver=None, plan=None, env=None):
+        return MainTests.main(self, ["--plan", "--goal", self.GOAL, "--expect", expect, "--json"],
+                              driver=driver or FakeDriver(state=dict(STATE, window_title="Storage")),
+                              plan=plan or planner(self.STEPS), env=env)
+
+    def test_an_unverified_plan_run_forgets_the_plan(self):
+        with mock.patch.object(gui.jev_plan, "forget") as forget:
+            code, printed, _ = self.main("Somewhere Else")
+        self.assertEqual(code, 4)
+        forget.assert_called_once_with(self.GOAL, front_app="Safari", running_apps=["Safari", "System Settings"])
+        self.assertIn("plan cache: forgot this plan", printed)
+
+    def test_a_verified_plan_run_keeps_the_plan(self):
+        with mock.patch.object(gui.jev_plan, "forget") as forget:
+            code, _, _ = self.main("Storage")
+        self.assertEqual(code, 0)
+        forget.assert_not_called()
+
+    def test_a_failed_step_forgets_the_plan_once_even_though_the_run_is_also_unverified(self):
+        driver = FakeDriver(failing={"press_key": "press_key: no such window"})
+        with mock.patch.object(gui.jev_plan, "forget") as forget:
+            code, _, _ = self.main("Somewhere Else", driver=driver)
+        self.assertEqual(code, 4)
+        forget.assert_called_once()
+
+    def test_a_failed_step_forgets_the_plan_without_main(self):
+        """run_plan has other callers than main(), and they have no exit code to go on."""
+        with mock.patch.object(gui.jev_plan, "forget") as forget:
+            run_plan(self.GOAL, self.STEPS, driver=FakeDriver(failing={"press_key": "no such window"}))
+        forget.assert_called_once_with(self.GOAL, front_app="Safari", running_apps=["Safari", "System Settings"])
+
+    def test_a_plan_run_that_is_interrupted_forgets_the_plan(self):
+        """Ctrl-C because the plan is doing the wrong thing is the run that most needs its
+        plan forgotten, and the exception used to leave run_plan before anything was."""
+        for failure in (KeyboardInterrupt(), RuntimeError("the driver died")):
+            with self.subTest(failure=failure), mock.patch.object(gui.jev_plan, "forget") as forget, \
+                    mock.patch.object(gui, "run_direct", side_effect=failure):
+                with self.assertRaises(type(failure)):
+                    run_plan(self.GOAL, self.STEPS)
+                forget.assert_called_once_with(self.GOAL, front_app="Safari", running_apps=["Safari", "System Settings"])
+
+    def test_with_the_cache_off_nothing_is_forgotten_and_nothing_says_it_was(self):
+        """forget() returns at once when JEV_MEMO=off, but the runner still printed "forgot
+        this plan", about a plan that was never kept."""
+        def off(command, **context):
+            return dict(planner(self.STEPS)(command, **context), cache="off")
+
+        with mock.patch.object(gui.jev_plan, "forget") as forget:
+            code, printed, _ = self.main("Somewhere Else", plan=off)
+        self.assertEqual(code, 4)
+        forget.assert_not_called()
+        self.assertNotIn("plan cache: forgot", printed)
+
+    def test_a_fallback_has_nothing_to_forget(self):
+        """Only a real plan is ever stored. The whole-goal loop ending unverified says
+        nothing about a plan that was never used."""
+        with mock.patch.object(gui.jev_plan, "forget") as forget:
+            self.main("Somewhere Else", plan=planner([{"kind": "goal", "text": self.GOAL}], "fallback", "timeout"))
+        forget.assert_not_called()
+
+    def test_forget_blowing_up_does_not_change_the_exit_code(self):
+        with mock.patch.object(gui.jev_plan, "forget", side_effect=RuntimeError("cache bug")):
+            code, _, _ = self.main("Somewhere Else")
+        self.assertEqual(code, 4)
+
+    def test_an_older_jevkit_whose_planner_has_no_cache_still_runs(self):
+        """The installer vendors jevkit, so this script can meet a plan.py with no forget()."""
+        older = mock.Mock(spec=["plan", "clean_step", "enforce_never_send", "safe_app_name", "parse_keys"],
+                          plan=planner(self.STEPS), clean_step=gui.jev_plan.clean_step,
+                          enforce_never_send=gui.jev_plan.enforce_never_send,
+                          safe_app_name=gui.jev_plan.safe_app_name, parse_keys=gui.jev_plan.parse_keys)
+        with mock.patch.object(gui, "jev_plan", older):
+            code, printed, _ = MainTests.main(self, ["--plan", "--goal", self.GOAL, "--expect", "Somewhere Else", "--json"])
+        self.assertEqual(code, 4)
+        self.assertEqual(json.loads(printed.strip().splitlines()[-1])["plan"]["cache"], "miss")
+
+    def test_the_report_and_the_printed_plan_line_say_what_the_cache_did(self):
+        def cached(command, **context):
+            return dict(planner(self.STEPS)(command, **context), cache="hit", latency_ms=1)
+
+        code, printed, _ = self.main("Storage", plan=cached)
+        result = json.loads(printed.strip().splitlines()[-1])
+        self.assertEqual(result["plan"]["cache"], "hit")
+        self.assertIn("1 ms, cache hit", printed)
+
+    def test_a_cached_plan_that_ends_unverified_is_not_served_again(self):
+        """End to end, with the real plan(), the real forget() and a real cache file: the
+        one thing a mocked forget() cannot show is that both work out the SAME key."""
+        real_plan = gui.jev_plan.plan          # taken now: main() below swaps the attribute for `plan`
+
+        reply = json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"steps": [
+            dict(step, text="", amount=0) for step in self.STEPS]})}}]}).encode()
+        for expect, calls_expected, caches in (("Somewhere Else", 2, ["miss", "miss"]), ("Storage", 1, ["miss", "hit"])):
+            calls = []
+
+            def transport(url, body, headers, timeout):
+                calls.append(url)
+                return reply
+
+            def plan(command, **context):
+                return real_plan(command, transport=transport, **context)
+
+            with self.subTest(expect=expect), tempfile.TemporaryDirectory() as home:
+                env = {"XDG_CACHE_HOME": home, "JEV_MEMO": "on", "JEV_PLAN_MODEL": "test/model",
+                       "TEXT_MODEL_BASE_URL": "https://openrouter.ai/api/v1", "TEXT_MODEL_API_KEY": ""}
+                seen = [json.loads(self.main(expect, plan=plan, env=env)[1].strip().splitlines()[-1])["plan"]["cache"]
+                        for _ in range(2)]
+                self.assertEqual((len(calls), seen), (calls_expected, caches))
