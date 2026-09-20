@@ -145,7 +145,7 @@ CONFIDENTIALITY — these override the rules above wherever they conflict:
 def redact_capsule(text: str, limit: int = 6000) -> str:
     """Mechanical backstop over a written capsule: emails, phones, tokens, long ids.
 
-    The prompt above is the real control, because only the writer knows that "Kiridena"
+    The prompt above is the real control, because only the writer knows that "Doe"
     is a customer. This catches the shapes a regex *can* be sure about, so a writer that
     ignores its instructions still cannot leave a phone number on disk. Both layers
     exist because neither is sufficient: one is reliable but blind, the other sees but

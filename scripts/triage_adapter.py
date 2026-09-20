@@ -13,8 +13,7 @@ Classify every message as it lands: work now, today, queue, or ignore.
 
 The router already decides *whose* message this is. It does not decide how much it
 matters, and the thing it uses instead — a regex over the subject line — only fires on
-words like "urgent" and "down". A customer who writes "I can't read incoming PO's to do
-anything" is completely stuck and matches none of them.
+words like "urgent" and "down". A customer who writes "I cannot open any of today's orders" is completely stuck and matches none of them.
 
 So each newly-seen message gets one Jev call: a five-level urgency rubric, a kind, and a
 few yes/no readings. About 400-800ms and roughly six cents per thousand messages, which
@@ -33,7 +32,7 @@ Three rules this module exists to enforce:
     classifier that starts steering traffic before a person has read its output is how
     you end up paging someone about a newsletter.
 
-  * **Honour the router's emit contract.** ``source4ai_support_router_v2`` promises to
+  * **Honour the router's emit contract.** The host router promises to
     persist "never bodies, never subjects, never addresses beyond domain". A body is
     read here to classify it and is then dropped; what lands on disk is an id, a domain,
     a route and some numbers. ``review`` re-joins those ids against the local intake

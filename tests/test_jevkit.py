@@ -1181,7 +1181,7 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(out["route"], "ignore")
 
     def test_a_stuck_customer_is_escalated_even_when_they_phrase_it_calmly(self):
-        """The real case: "can't do anything with these" scored mid-rubric and sat in today."""
+        """The real case: "cannot do anything with these" scored mid-rubric and sat in today."""
         out = triage.classify("Can't read incoming POs", "I can't do anything with these PDFs",
                               sender="s@customer.com", known_customer=True,
                               transport=jev_mail({2: 0.5, 3: 0.4, 4: 0.1}, kind="problem", blocked=0.6))
@@ -1218,7 +1218,7 @@ class TriageTests(unittest.TestCase):
     def test_automated_mail_is_recognised_without_a_model(self):
         self.assertTrue(triage._looks_automated("mailer-daemon@x.com", "Undeliverable"))
         self.assertTrue(triage._looks_automated("noreply@x.com", "Your receipt"))
-        self.assertFalse(triage._looks_automated("suzanne@customer.com", "Can't read the POs"))
+        self.assertFalse(triage._looks_automated("dana@customer.com", "Cannot open the orders"))
 
     def test_summary_counts_routes_and_flags_low_confidence(self):
         rows = [triage.classify(f"s{i}", "body text here",
@@ -1233,7 +1233,7 @@ class TriageTests(unittest.TestCase):
 class ConfidentialHandoffTests(unittest.TestCase):
     """Some deployments forbid carrying customer detail into the next session.
 
-    ECVA's own continuity rule is explicit: "Continuity may store only task, source
+    One customer's own continuity rule is explicit: "Continuity may store only task, source
     classes checked, missing evidence, owner/approval, and next safe action — never raw
     sensitive content." A handoff that summarises a customer conversation breaks that
     rule by default, so confidentiality has to be a mode the capsule is built in, not a
@@ -1276,10 +1276,10 @@ class ConfidentialHandoffTests(unittest.TestCase):
     # ── the mechanical backstop ──────────────────────────────────────────────
 
     def test_redact_capsule_removes_the_shapes_a_regex_can_be_sure_about(self):
-        text = ("## Working on\nQuote for Ashanthi at suzanne@example.com, call "
+        text = ("## Working on\nQuote for Jane at dana@example.com, call "
                 "(850) 555-0134, doc 3f2504e0-4f89-11d3-9a0c-0305e82c3301.")
         out = compact.redact_capsule(text)
-        self.assertNotIn("suzanne@example.com", out)
+        self.assertNotIn("dana@example.com", out)
         self.assertNotIn("555-0134", out)
         self.assertNotIn("3f2504e0-4f89-11d3-9a0c-0305e82c3301", out)
         self.assertIn("## Working on", out)      # structure survives
@@ -1299,7 +1299,7 @@ class ConfidentialHandoffTests(unittest.TestCase):
     def test_a_refusing_writer_does_not_dump_the_transcript_under_confidentiality(self):
         """The non-confidential fallback writes the raw transcript. Here that is the
         single worst outcome, so the capsule must say nothing instead."""
-        messages = [{"role": "user", "content": "Ashanthi Kiridena wants the quote revised"}
+        messages = [{"role": "user", "content": "Jane Doe wants the quote revised"}
                     for _ in range(12)]
         out = self.ho.build("s1", "lane", write=lambda p: "I'm sorry, I can't help with that.",
                             valid=lambda t: "## Working on" in t and "sorry" not in t,
@@ -1307,7 +1307,7 @@ class ConfidentialHandoffTests(unittest.TestCase):
                             runner=self._runner(messages))
         self.assertEqual(out["status"], "ok")
         text = Path(out["path"]).read_text()
-        self.assertNotIn("Kiridena", text)
+        self.assertNotIn("Doe", text)
         self.assertNotIn("did not return a usable handoff", text)
         self.assertIn("Ask the person what they were working on", text)
 
@@ -1428,7 +1428,7 @@ class TrivialTurnGateTests(unittest.TestCase):
     REAL = ["open settings", "rename the file", "Open the Settings app and turn on Night Shift.",
             "Go to wikipedia and read the article", "route this turn",
             "escalate to a frontier model", "what time is my next meeting?",
-            "who is Suzanne again?", "fix the printer dialog", "summarise this conversation",
+            "who is Dana again?", "fix the printer dialog", "summarise this conversation",
             "no, use the other browser profile instead", "no, the other one",
             "stop the gateway service", "go to the settings page", "whats the status"]
 

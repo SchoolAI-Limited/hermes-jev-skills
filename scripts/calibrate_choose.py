@@ -172,7 +172,7 @@ CASES = [
     case("no_answer", "Approve the pending purchase order.",
          [("row-wifi", "Select the Wi-Fi row."), ("row-bt", "Select the Bluetooth row."),
           ("row-sound", "Select the Sound row.")], None),
-    case("no_answer", "Reply to Suzanne's email about the quote.",
+    case("no_answer", "Reply to Dana's email about the quote.",
          [("btn-zoom-in", "Choose Zoom In."), ("btn-zoom-out", "Choose Zoom Out."),
           ("btn-rotate", "Rotate the image.")], None),
     case("no_answer", "Book the 3pm meeting room.",

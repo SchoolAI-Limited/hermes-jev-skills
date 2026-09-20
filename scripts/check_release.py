@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Refuse to ship secrets or machine-specific paths. Run before every push."""
+import os
 import re
 import subprocess
 import sys
@@ -22,6 +23,17 @@ files = _git.stdout.split()
 if _git.returncode != 0 or not files:
     sys.exit("check_release: nothing was scanned (not a git checkout, or git failed). "
              "This is not a pass.")
+
+# Strings that must never ship, read from a file that is NOT in the repo. A real customer's
+# name reached a public release inside a test fixture, copied from a live system while
+# debugging it. Nothing caught it, because the only pattern this script knew was a home
+# path. The list cannot live here: naming what to keep out would publish it.
+_DENY_FILE = Path(os.environ.get("JEV_RELEASE_DENYLIST", Path.home() / ".config" / "jev" / "release-denylist.txt"))
+_DENY = []
+if _DENY_FILE.is_file():
+    _DENY = [l.strip().lower() for l in _DENY_FILE.read_text(encoding="utf-8").splitlines()
+             if l.strip() and not l.startswith("#")]
+
 problems = []
 for name in files:
     path = ROOT / name
@@ -33,5 +45,10 @@ for name in files:
             continue
         for match in pattern.finditer(text):
             problems.append(f"{name}: {label}: {match.group(0)[:24]}…")
+    lowered = text.lower()
+    for entry in _DENY:
+        if entry in lowered:
+            # Name the file and the rule, never the string: this output lands in CI logs.
+            problems.append(f"{name}: contains an entry from the release denylist (#{_DENY.index(entry) + 1})")
 print("\n".join(problems) if problems else f"clean: {len(files)} files")
 sys.exit(1 if problems else 0)

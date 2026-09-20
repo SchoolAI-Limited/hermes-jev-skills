@@ -120,7 +120,7 @@ def classify(
 
     # A known customer reporting a broken thing they cannot work around is the case this
     # exists for. Requiring near-certainty on "blocked" misses exactly those messages —
-    # people describe being stuck plainly, not urgently ("can't do anything with these").
+    # people describe being stuck plainly, not urgently ("cannot do anything with these").
     # ...but "stuck" alone is not enough. A customer musing about agent issues reads as
     # mildly blocked too, and escalating that trains everyone to ignore the now pile.
     # Require the message to also sit at least at "this week" on the rubric.

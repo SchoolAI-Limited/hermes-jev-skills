@@ -68,7 +68,7 @@ domain, a route and some numbers:
 
 ```json
 {"id": "287d5b89", "message_id": "imap-uid:15:5c71...", "domain": "example.com",
- "tenant": "ecva", "route": "queue", "urgency": 1.18, "kind": "request",
+ "tenant": "acme", "route": "queue", "urgency": 1.18, "kind": "request",
  "confidence": 0.85, "blocked": 0.13, "sent_to_jev": true, "latency_ms": 491}
 ```
 
@@ -109,9 +109,9 @@ python3 scripts/triage_adapter.py --route now --route today
 ```
 now=3  today=2
 
-now    u=3.91  problem    example.com    Office agent meltdown
-now    u=2.79  problem    example.com    Can't read incoming PO's in PDF format
-today  u=2.68  request    example.com    Agent access across apps
+now    u=3.91  problem    example.com    Checkout is down for everyone
+now    u=2.79  problem    example.com    Cannot open any of today's orders
+today  u=2.68  request    example.com    Add a user to the shared workspace
 ```
 
 ## What the numbers looked like
