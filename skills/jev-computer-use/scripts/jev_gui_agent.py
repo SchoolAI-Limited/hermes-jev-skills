@@ -80,6 +80,20 @@ INTERACTIVE_ROLES = {
     "AXTab", "AXSlider", "AXDisclosureTriangle", "AXSegmentedControl",
 }
 
+# The chooser contract caps a table at 32 candidates. build_table always appends these,
+# so the element budget is whatever is left. Stated here once rather than as a magic 26.
+STANDARD_ACTIONS = (
+    ("scroll-down", "Scroll the page down to reveal more elements."),
+    ("scroll-up", "Scroll the page up."),
+    ("wait", "Wait one second for the page to finish changing."),
+    ("reobserve", "Take a fresh observation without changing anything."),
+    ("done", "The goal is fully achieved and independently verified."),
+    ("abstain", "Stop and ask the person for help."),
+)
+MAX_CANDIDATES = 32
+MAX_REGIONS = MAX_CANDIDATES - len(STANDARD_ACTIONS)
+
+
 # ---------------------------------------------------------------- MCP client
 
 
@@ -265,14 +279,7 @@ def build_table(rows: list[dict]) -> tuple[list[dict], list[dict]]:
             "description": f"{verb} [{i}] {r['role'].replace('AX','').lower()} "
                            f"\"{single_line(r['label'])}\".",
         })
-    for extra, desc in (
-        ("scroll-down", "Scroll the page down to reveal more elements."),
-        ("scroll-up", "Scroll the page up."),
-        ("wait", "Wait one second for the page to finish changing."),
-        ("reobserve", "Take a fresh observation without changing anything."),
-        ("done", "The goal is fully achieved and independently verified."),
-        ("abstain", "Stop and ask the person for help."),
-    ):
+    for extra, desc in STANDARD_ACTIONS:
         candidates.append({"id": extra, "description": desc})
     return regions, candidates
 
@@ -359,12 +366,23 @@ def _brief(res: dict) -> dict:
 
 
 def verify(rows: list[dict], title: str, expect: str) -> bool:
+    """Is the goal state actually reached? Deliberately strict about what counts.
+
+    Two false passes lived here, and the skill's own documented example hit both.
+
+    1. It matched `--expect` against any ELEMENT LABEL. `--expect 'Library'` passed on
+       every page of YouTube Music, because the left nav carries a Library link
+       everywhere. "A link named X exists" is not "page X is open", and the check ran
+       before the first action, so the runner exited 0 having clicked nothing.
+    2. An empty `--expect` returned True, and `--expect` defaults to "". Every run
+       without it reported PASS regardless of what happened.
+
+    The window title is the one signal that actually changes when you arrive somewhere,
+    so it is the only thing accepted. No expectation now means "unverified", not "pass".
+    """
     if not expect:
-        return True
-    needle = expect.lower()
-    if needle in (title or "").lower():
-        return True
-    return any(needle in r["label"].lower() for r in rows)
+        return False
+    return expect.lower() in (title or "").lower()
 
 
 # ---------------------------------------------------------------- main
@@ -376,15 +394,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--window-id", type=int, required=True)
     p.add_argument("--goal", required=True)
     p.add_argument("--max-steps", type=int, default=10)
-    p.add_argument("--max-regions", type=int, default=26,
-                   help="Element rows offered to Jev (26 keeps the table inside the "
-                        "32-candidate contract once the standard actions are added).")
+    p.add_argument("--max-regions", type=int, default=MAX_REGIONS,
+                   help=f"Element rows offered to Jev (max {MAX_REGIONS}: build_table "
+                        f"always appends {len(STANDARD_ACTIONS)} standard actions and the "
+                        f"contract caps the table at {MAX_CANDIDATES}).")
     p.add_argument("--expect", default="")
     p.add_argument("--values", default="", help="Pipe-separated pool for typed fields.")
     p.add_argument("--session", default="",
                    help="Optional cua-driver session label (omit when the transport has none).")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
+    # Above the cap the table is rejected by the contract on EVERY step, at step 1,
+    # every time - a flag that silently guarantees total failure is worse than no flag.
+    regions_cap = max(1, min(args.max_regions, MAX_REGIONS))
     values = [v.strip() for v in args.values.split("|") if v.strip()]
     tokens = goal_tokens(args.goal)
 
@@ -407,8 +429,10 @@ def main(argv: list[str] | None = None) -> int:
             os.environ["TYPESAFE_API_KEY"] = tok.stdout.strip()
     if not os.environ.get("TEXT_MODEL_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
         tok = subprocess.run(
+            # No hardcoded account: whoever runs this is the account. A name baked in
+            # here works on exactly one machine and fails silently on every other.
             ["security", "find-generic-password", "-s", "OPENROUTER_API_KEY",
-             "-a", "vibex", "-w"],
+             "-a", os.environ.get("USER", ""), "-w"],
             capture_output=True, text=True)
         if tok.returncode == 0 and tok.stdout.strip():
             os.environ["OPENROUTER_API_KEY"] = tok.stdout.strip()
@@ -432,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         for step in range(1, args.max_steps + 1):
             state = observe(driver, args.pid, args.window_id, args.session)
             title = state.get("window_title", "")
-            rows = element_rows(state, args.max_regions, tokens)
+            rows = element_rows(state, regions_cap, tokens)
             if not rows:
                 print(f"  step {step}: no interactive elements observed")
                 break
@@ -496,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             final = observe(driver, args.pid, args.window_id, args.session)
             title = final.get("window_title", title)
-            rows = element_rows(final, args.max_regions, tokens)
+            rows = element_rows(final, regions_cap, tokens)
         except Exception:  # noqa: BLE001
             pass
         driver.stop()
