@@ -32,6 +32,12 @@
   "delegate to another model" blurbs. Rewritten to front-load the discriminator, with a
   test importing `DESCRIPTION_CHARS` so the repo cannot ship a skill its own picker cannot
   read whole.
+- **Vision provenance was a quiet wrong answer.** `has_images` reached `_pick` but was
+  never carried into the returned decision, so it never reached the log, so the dashboard
+  checked the vision pool *last* and attributed every image turn that used a dual-listed
+  model to `general`. It now rides through `route()` into the log line, and provenance
+  mirrors `_pick` instead of guessing.
+
 - **The dashboard shows the axis instead of hiding it.** Pools render as a tier x specialty
   grid where an empty pool is a visible gap, the live view credits the pool a model came
   from (`medium / coding` versus `medium / general (fallback)`), and a dead axis is named

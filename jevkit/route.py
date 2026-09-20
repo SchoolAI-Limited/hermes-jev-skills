@@ -375,7 +375,11 @@ def decide(
     return _remember(cache_key, {
         "routed": picked != current, "model": picked, "provider": provider, "model_id": model, "tier": tier,
         **({"escalate": escalation} if escalation else {}),
-        "specialty": specialty, "confidence": round(confidence, 3), "difficulty": round(difficulty, 2),
+        # Carried out so a reader can tell WHICH pool the model came from. Without it a
+        # model listed in both `vision` and `general` is unattributable after the fact,
+        # and "did the specialty answer earn its keep?" becomes unanswerable.
+        "specialty": specialty, "has_images": bool(has_images),
+        "confidence": round(confidence, 3), "difficulty": round(difficulty, 2),
         "costly_mistake": round(stakes, 3), "private": private, "mode": mode, "latency_ms": reply["latency_ms"],
         "policy": POLICY_VERSION, "reason": f"{tier} {specialty}", "unwrapped": unwrapped,
         "notice": (f"[Jev] {tier} · {specialty} → {model} · confidence {confidence:.2f}"

@@ -149,8 +149,11 @@ def _on_llm_request(request: Optional[Dict[str, Any]] = None, session_id: str = 
             pinned=bool(default_bare) and bare != default_bare)   # you ran /model: your choice wins
         turn["decision"] = decision
         _log({"kind": "route", "mode": mode, "from": current, **{k: decision.get(k) for k in (
-            "routed", "model", "tier", "specialty", "confidence", "difficulty", "costly_mistake", "private",
-            "reason", "latency_ms", "policy")}})
+            # has_images is logged so a reader can tell the vision pool from the general
+            # one after the fact. Without it a model listed in both is unattributable, and
+            # "is the specialty answer earning its keep?" cannot be answered from the log.
+            "routed", "model", "tier", "specialty", "has_images", "confidence", "difficulty",
+            "costly_mistake", "private", "reason", "latency_ms", "policy")}})
     if mode != "on" or not decision.get("routed") or not decision.get("model_id"):
         return None
     return {"request": {**request, "model": decision["model_id"]}}

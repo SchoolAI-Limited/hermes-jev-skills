@@ -536,7 +536,8 @@ def jev_live(hermes_home: str, since: float = 0.0, limit: int = 200) -> dict[str
         if e.get("model") and e.get("tier") and name in homes:
             if name not in grids:
                 grids[name] = pools.grid_for(hermes_home, homes[name])["tiers"]
-            e["pool"] = pools.locate(grids[name], str(e["tier"]), str(e.get("specialty") or ""), str(e["model"]))
+            e["pool"] = pools.locate(grids[name], str(e["tier"]), str(e.get("specialty") or ""),
+                                      str(e["model"]), bool(e.get("has_images")))
 
     return {"now": time.time(), "events": events, "switches": switches,
             "plugin_installed": os.path.isdir(os.path.join(hermes_home, "plugins", "hermes-jev")),

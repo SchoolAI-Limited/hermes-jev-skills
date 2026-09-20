@@ -249,3 +249,35 @@ class ContractDriftTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class VisionProvenanceTests(unittest.TestCase):
+    """A model in both `vision` and `general` used to be blamed on `general`.
+
+    The decision log did not record whether the turn carried images, so provenance
+    checked the vision pool last and quietly gave the wrong answer for every image turn.
+    `has_images` now rides along in the log line, so this mirrors route._pick.
+    """
+
+    CELL = {"models": [{"ref": "openrouter:m", "excluded": False}]}
+    GRID = {"medium": {"general": CELL, "vision": CELL,
+                       "coding": {"models": []}, "writing": {"models": []},
+                       "research": {"models": []}}}
+
+    def test_an_image_turn_is_credited_to_the_vision_pool(self):
+        found = pools.locate(self.GRID, "medium", "general", "openrouter:m", True)
+        self.assertEqual(found["specialty"], "vision")
+
+    def test_a_text_turn_with_the_same_model_is_credited_to_general(self):
+        found = pools.locate(self.GRID, "medium", "general", "openrouter:m", False)
+        self.assertEqual(found["specialty"], "general")
+
+    def test_the_search_order_matches_pick_for_an_image_turn(self):
+        order = pools._search_order("medium", "coding", True)
+        self.assertEqual(order[0], ("medium", "vision"))
+        self.assertEqual(order[1], ("medium", "coding"))
+
+    def test_the_search_order_leaves_vision_last_without_images(self):
+        order = pools._search_order("medium", "coding", False)
+        self.assertEqual(order[0], ("medium", "coding"))
+        self.assertIn(("medium", "vision"), order[2:])

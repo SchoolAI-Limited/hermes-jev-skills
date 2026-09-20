@@ -229,24 +229,29 @@ def tier_grid(hermes_home: str, homes: list) -> dict:
 # ------------------------------------------------------------------ provenance
 
 
-def _search_order(tier: str, specialty: str) -> list:
+def _search_order(tier: str, specialty: str, has_images: bool = False) -> list:
     """The (tier, pool) pairs route._pick would walk, most likely first.
 
     _pick never falls down a tier, and inside one it tries the specialty pool before
-    general. Vision comes first there when the turn had images, which the decision log
-    does not record, so it is checked last here: any other pool holding the model
-    explains the choice without guessing.
+    general. Vision comes FIRST when the turn carried images, exactly as _pick does.
+
+    That used to be unknowable here: the decision log did not record whether a turn had
+    images, so vision was checked last and a model listed in both `vision` and `general`
+    was attributed to `general` — a quiet wrong answer. `has_images` is now carried
+    through route() into the log line, so this mirrors _pick instead of guessing.
     """
     order: list = []
     tiers = TIERS[TIERS.index(tier):] if tier in TIERS else (tier,)
+    lead = ("vision",) if has_images else ()
+    tail = () if has_images else ("vision",)
     for candidate in tiers:
-        for name in (specialty, "general", "vision"):
+        for name in lead + (specialty, "general") + tail:
             if (candidate, name) not in order:
                 order.append((candidate, name))
     return order
 
 
-def locate(grid: dict, tier: str, specialty: str, ref: str) -> dict:
+def locate(grid: dict, tier: str, specialty: str, ref: str, has_images: bool = False) -> dict:
     """Which pool a routed model came from, and whether the specialty answer chose it.
 
     `earned` is the honest answer to "is the specialization axis worth its money":
@@ -255,7 +260,7 @@ def locate(grid: dict, tier: str, specialty: str, ref: str) -> dict:
     there was nothing to earn.
     """
     specialty = specialty or "general"
-    for candidate_tier, name in _search_order(tier, specialty):
+    for candidate_tier, name in _search_order(tier, specialty, has_images):
         cell = (grid.get(candidate_tier) or {}).get(name) or {}
         if any(m.get("ref") == ref for m in cell.get("models") or []):
             return {
