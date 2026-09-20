@@ -8,6 +8,7 @@ a wrong answer can only ever be one of the actions you already judged safe.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -18,7 +19,31 @@ RESPONSE_SCHEMA = "jev.action_choice_v1"
 MAX_CANDIDATES = 32
 MAX_REGIONS = 100
 MAX_HISTORY = 16
-MIN_CONFIDENCE = 0.80
+def _floor() -> float:
+    """The confidence below which `choose` declines to act. Measured, not guessed.
+
+    It was 0.80, chosen by feel, and it was throwing away answers Jev had right: a live
+    run lost "open the Sound pane" at 0.74. scripts/calibrate_choose.py replays labelled
+    cases - including traps and screens where the only right move is not to act - at
+    every threshold. With on-screen regions supplied, as the real runner supplies them:
+
+      * correct answers scored 0.93-0.99 synthetic, 0.74-0.90 on a live 26-row table
+      * the ONE wrong answer ("cancel without losing my work" -> Save) was wrong 9 runs
+        in 10 but never above 0.58. Jev knows when it is unsure; the floor just has to
+        sit above where the wrong answers live.
+
+    0.60 blocks that case by 0.02, which is inside the +-0.08 run-to-run noise. 0.65 keeps
+    every real-world correct answer and leaves actual margin. JEV_MIN_CONFIDENCE overrides
+    it, clamped so it can never be set down into the band where wrong answers were seen.
+    """
+    try:
+        value = float(os.environ.get("JEV_MIN_CONFIDENCE", "") or 0.65)
+    except ValueError:
+        value = 0.65
+    return min(0.95, max(0.60, value))
+
+
+MIN_CONFIDENCE = _floor()
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 
 

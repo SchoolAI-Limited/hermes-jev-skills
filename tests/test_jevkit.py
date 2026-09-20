@@ -1511,3 +1511,27 @@ class SpecializationAxisTests(unittest.TestCase):
     def test_doctor_warns_about_a_dead_axis(self):
         blind = route.dead_axis({"tiers": {"medium": {"general": ["a:b"]}}})
         self.assertEqual(blind, ["medium"])
+
+
+class ConfidenceFloorTests(unittest.TestCase):
+    """The floor was 0.80 by feel and threw away answers Jev had right.
+
+    scripts/calibrate_choose.py measured it: correct answers 0.74-0.99, and the only wrong
+    answer seen - "cancel without losing my work" -> Save, wrong nine runs in ten - never
+    rose above 0.58. The floor has to sit between those. These pin the band, so nobody
+    "tunes" it back down into the region where the wrong answers were observed.
+    """
+
+    def test_the_floor_sits_above_the_highest_wrong_answer_seen(self):
+        self.assertGreater(choose.MIN_CONFIDENCE, 0.58)
+
+    def test_the_floor_admits_the_lowest_real_world_correct_answer(self):
+        self.assertLessEqual(choose.MIN_CONFIDENCE, 0.74)
+
+    def test_an_override_cannot_push_it_into_the_wrong_answer_band(self):
+        import importlib
+        with mock.patch.dict(os.environ, {"JEV_MIN_CONFIDENCE": "0.2"}):
+            self.assertGreaterEqual(importlib.reload(choose).MIN_CONFIDENCE, 0.60)
+        with mock.patch.dict(os.environ, {"JEV_MIN_CONFIDENCE": "not-a-number"}):
+            self.assertEqual(importlib.reload(choose).MIN_CONFIDENCE, 0.65)
+        importlib.reload(choose)

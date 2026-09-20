@@ -253,20 +253,33 @@ def element_rows(state: dict, max_regions: int, tokens: list[str] | None = None)
     seen: set[tuple[str, int, int]] = set()
     # macOS sidebars, lists and tables are AXOutline/AXTable -> AXRow -> AXStaticText. The
     # ROW is what you click and it carries no label; the LABEL is on a child static text
-    # that is not interactive. Filtering on role alone therefore dropped every sidebar
-    # item: on System Settings "Displays" was in the tree and never offered, so Jev
-    # answered with 0.35 confidence because the right answer was not on the table. The
-    # tree is flat, so the pairing is geometric: a label whose frame sits inside a row's
-    # frame is that row's name.
-    row_frames = [el.get("frame") for el in state.get("elements", [])
-                  if el.get("role") in ("AXRow", "AXCell") and el.get("frame")]
+    # that is not interactive. Filtering on role alone dropped every sidebar item: on
+    # System Settings "Displays" was in the tree and never offered, so Jev answered at
+    # 0.35 because the right answer was not on the table.
+    #
+    # The driver reports `parent_index`, so this follows the real tree. An earlier
+    # version guessed from frame overlap, which cannot work for a row scrolled out of
+    # view - it has no frame - and that is exactly the row you most need to know about.
+    by_index = {el.get("element_index"): el for el in state.get("elements", [])}
 
-    def _in_a_row(frame: dict) -> bool:
-        cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2
-        cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2
-        return any(float(r.get("x", 0)) <= cx <= float(r.get("x", 0)) + float(r.get("w", 0))
-                   and float(r.get("y", 0)) <= cy <= float(r.get("y", 0)) + float(r.get("h", 0))
-                   for r in row_frames)
+    def _row_of(el: dict) -> dict | None:
+        """The enclosing row, preferring AXRow over AXCell.
+
+        Stopping at the first AXCell looked right and lost the selection: the tree is
+        AXRow -> AXCell -> AXStaticText and `selected` lives on the ROW, so every row
+        read as unselected and arrival could never be proved.
+        """
+        node, hops, cell = el, 0, None
+        while node is not None and hops < 5:
+            node = by_index.get(node.get("parent_index"))
+            if node is None:
+                break
+            if node.get("role") == "AXRow":
+                return node
+            if node.get("role") == "AXCell" and cell is None:
+                cell = node
+            hops += 1
+        return cell
 
     for el in state.get("elements", []):
         label = (el.get("label") or "").strip()
@@ -274,11 +287,13 @@ def element_rows(state: dict, max_regions: int, tokens: list[str] | None = None)
             continue
         role = el.get("role") or ""
         acts = el.get("actions") or []
-        row_label = role == "AXStaticText" and bool(el.get("frame")) and _in_a_row(el["frame"])
-        if role not in INTERACTIVE_ROLES and "AXPress" not in acts and not row_label:
+        row = _row_of(el) if role == "AXStaticText" else None
+        if role not in INTERACTIVE_ROLES and "AXPress" not in acts and row is None:
             continue
-        if row_label:
+        selected = bool(el.get("selected"))
+        if row is not None:
             role = "AXRow"           # describe it to Jev as what it is: a selectable row
+            selected = selected or bool(row.get("selected"))
         frame = el.get("frame") or {}
         x, y = float(frame.get("x", 0)), float(frame.get("y", 0))
         w, h = float(frame.get("w", 0)), float(frame.get("h", 0))
@@ -298,6 +313,7 @@ def element_rows(state: dict, max_regions: int, tokens: list[str] | None = None)
             "local_x": x - bx, "local_y": y - by,
             "cx": x - bx + w / 2, "cy": y - by + h / 2,
             "index": el.get("element_index"),
+            "selected": selected,
         })
     rows.sort(key=lambda r: (-relevance(r["label"], tokens), r["y"], r["x"]))
     return rows[:max_regions]
@@ -307,7 +323,29 @@ def single_line(text: str, limit: int = 78) -> str:
     return " ".join(text.split())[:limit]
 
 
-def build_table(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+def offscreen_matches(state: dict, tokens: list[str], limit: int = 3) -> list[str]:
+    """Goal-relevant labels that are in the tree but scrolled out of view.
+
+    A row below the fold has no frame, so it cannot be clicked and is rightly left off
+    the table. But leaving Jev ignorant of it is a different mistake: asked to open
+    "Sound" with Sound off-screen, it scored 0.33 and the run stalled, because from where
+    it sat nothing on the table served the goal. It was right. The fix is not to lower
+    the floor until it guesses - it is to say the thing exists further down, so that
+    scrolling becomes the obviously correct move instead of a shot in the dark.
+    """
+    if not tokens:
+        return []
+    found: list[str] = []
+    for el in state.get("elements", []):
+        label = (el.get("label") or "").strip()
+        if not label or el.get("frame"):
+            continue
+        if relevance(label, tokens) and label not in found:
+            found.append(label[:40])
+    return found[:limit]
+
+
+def build_table(rows: list[dict], below: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     regions: list[dict] = []
     candidates: list[dict] = []
     for i, r in enumerate(rows):
@@ -323,6 +361,9 @@ def build_table(rows: list[dict]) -> tuple[list[dict], list[dict]]:
                            f"\"{single_line(r['label'])}\".",
         })
     for extra, desc in STANDARD_ACTIONS:
+        if extra == "scroll-down" and below:
+            names = ", ".join(f'"{single_line(b, 30)}"' for b in below)
+            desc = f"Scroll down: {names} exists further down this list but is not visible yet."
         candidates.append({"id": extra, "description": desc})
     return regions, candidates
 
@@ -408,6 +449,21 @@ def _brief(res: dict) -> dict:
     }
 
 
+_DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")
+
+
+def _fold(text: str) -> str:
+    """Compare what a person typed with what an app displays.
+
+    macOS writes "Wi\u2011Fi" with a NON-BREAKING hyphen. `--expect Wi-Fi` never matched
+    it, so a click that landed first time at 0.96 confidence was reported unverified and
+    the runner clicked it five more times. Fold dash variants and width forms before
+    comparing; nobody can see the difference, so the check must not depend on it.
+    """
+    import unicodedata
+    return unicodedata.normalize("NFKC", text or "").translate(_DASHES).casefold().strip()
+
+
 def verify(rows: list[dict], title: str, expect: str) -> bool:
     """Is the goal state actually reached? Deliberately strict about what counts.
 
@@ -425,7 +481,15 @@ def verify(rows: list[dict], title: str, expect: str) -> bool:
     """
     if not expect:
         return False
-    return expect.lower() in (title or "").lower()
+    needle = _fold(expect)
+    if needle in _fold(title or ""):
+        return True
+    # Some apps never title their window: System Settings reports an empty title on the
+    # General pane, so title-only checking could not pass there however right the click.
+    # "The row named X is the SELECTED row" is real proof of arrival. It is not the old
+    # bug in disguise: that accepted a row named X merely EXISTING, which is true on
+    # every page. Selection is only true once you are there.
+    return any(r.get("selected") and needle in _fold(r.get("label", "")) for r in rows)
 
 
 # ---------------------------------------------------------------- main
@@ -519,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
                 steps = step - 1
                 print(f"  verified before step {step}; stopping")
                 break
-            regions, candidates = build_table(rows)
+            regions, candidates = build_table(rows, offscreen_matches(state, tokens))
             request = {
                 "schema": "jev.action_choice_request_v1",
                 "goal": args.goal,
@@ -529,7 +593,9 @@ def main(argv: list[str] | None = None) -> int:
                 "candidates": candidates,
             }
             try:
+                t_jev = time.time()
                 reply = jev_choose(request)
+                jev_ms = int((time.time() - t_jev) * 1000)
             except ValueError as exc:
                 print(f"  step {step}: request rejected by the Jev contract: {exc}")
                 break
@@ -549,11 +615,15 @@ def main(argv: list[str] | None = None) -> int:
             t1 = time.time()
             op, detail = execute(driver, args.pid, args.window_id, args.session,
                                  action, rows, args.goal, values)
-            print(f"  step {step:>2}  {round((time.time()-t1)*1000):>5} ms  op={op}  "
-                  f"conf={confidence}  {detail[:110]}")
+            action_ms = int((time.time() - t1) * 1000)
+            print(f"  step {step:>2}  jev {jev_ms:>4} ms + act {action_ms:>4} ms  op={op}  "
+                  f"conf={confidence}  {detail[:100]}")
+            # These were one field called `decision_ms` that actually timed the CLICK. It
+            # made a 470 ms Jev decision look like 2.6 s and sent the latency hunt after
+            # the wrong component: the time is the driver confirming the click's effect.
             log.append({"step": step, "action": action, "op": op,
                         "detail": detail, "confidence": confidence,
-                        "decision_ms": int((time.time() - t1) * 1000)})
+                        "decision_ms": jev_ms, "action_ms": action_ms})
             history.append({"selected_id": action, "outcome": f"{op}: {detail[:80]}"})
             if op == "no-op":
                 time.sleep(0.3)

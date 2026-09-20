@@ -100,13 +100,20 @@ class SidebarRowTests(unittest.TestCase):
     With the pairing it answered at 0.90 and the click verified.
     """
 
+    # The driver's real shape: a flat list carrying element_index / parent_index.
     STATE = {"elements": [
-        {"role": "AXRow", "frame": {"x": 949, "y": 880, "w": 215, "h": 32},
-         "actions": ["AXShowDefaultUI"]},
-        {"role": "AXStaticText", "label": "Displays", "element_token": "t1",
-         "frame": {"x": 963, "y": 884, "w": 78, "h": 24}, "actions": ["AXShowMenu"]},
-        {"role": "AXStaticText", "label": "Just a caption", "element_token": "t2",
-         "frame": {"x": 100, "y": 100, "w": 120, "h": 20}, "actions": []},
+        {"element_index": 1, "parent_index": 0, "role": "AXOutline"},
+        {"element_index": 2, "parent_index": 1, "role": "AXRow", "selected": True,
+         "frame": {"x": 949, "y": 880, "w": 215, "h": 32}, "actions": ["AXShowDefaultUI"]},
+        {"element_index": 3, "parent_index": 2, "role": "AXCell"},
+        {"element_index": 4, "parent_index": 3, "role": "AXStaticText", "label": "Displays",
+         "element_token": "t1", "frame": {"x": 963, "y": 884, "w": 78, "h": 24}},
+        {"element_index": 5, "parent_index": 0, "role": "AXStaticText", "label": "Just a caption",
+         "element_token": "t2", "frame": {"x": 100, "y": 100, "w": 120, "h": 20}},
+        # below the fold: in the tree, no frame
+        {"element_index": 6, "parent_index": 1, "role": "AXRow"},
+        {"element_index": 7, "parent_index": 6, "role": "AXStaticText", "label": "Sound",
+         "element_token": "t3"},
     ]}
 
     def test_a_label_inside_a_row_is_offered_as_that_row(self):
@@ -145,3 +152,38 @@ class InstalledLocationTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = saved
         self.assertIsNotNone(found)
+
+
+
+class SidebarSelectionTests(unittest.TestCase):
+    STATE = SidebarRowTests.STATE
+
+    def test_selection_travels_from_the_row_to_its_label(self):
+        """The ROW is selected; the LABEL is what we offer. Proof of arrival needs both."""
+        offered = {r["label"]: r for r in gui.element_rows(self.STATE, 26, [])}
+        self.assertTrue(offered["Displays"]["selected"])
+
+    def test_a_row_below_the_fold_is_not_offered_but_is_reported(self):
+        """It has no frame so it cannot be clicked - but Jev must be told it exists, or
+        "open Sound" scores 0.33 and stalls when the right move is simply to scroll."""
+        self.assertNotIn("Sound", {r["label"] for r in gui.element_rows(self.STATE, 26, ["sound"])})
+        self.assertEqual(gui.offscreen_matches(self.STATE, ["sound"]), ["Sound"])
+
+    def test_the_scroll_candidate_names_what_is_below(self):
+        _, candidates = gui.build_table([], ["Sound"])
+        scroll = next(c for c in candidates if c["id"] == "scroll-down")
+        self.assertIn("Sound", scroll["description"])
+
+
+class VerifyProofTests(unittest.TestCase):
+    def test_a_non_breaking_hyphen_does_not_defeat_verification(self):
+        """macOS titles the pane "Wi\u2011Fi". --expect Wi-Fi never matched, so a click that
+        landed first time at 0.96 was called unverified and repeated five more times."""
+        self.assertTrue(gui.verify([], "Wi\u2011Fi", "Wi-Fi"))
+
+    def test_a_selected_row_proves_arrival_when_the_window_has_no_title(self):
+        self.assertTrue(gui.verify([{"label": "General", "selected": True}], "", "General"))
+
+    def test_an_unselected_row_is_still_not_proof(self):
+        """The original false pass, which the selected-row rule must not reintroduce."""
+        self.assertFalse(gui.verify([{"label": "Library", "selected": False}], "Home", "Library"))

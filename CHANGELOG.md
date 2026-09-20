@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.11.0 (2026-09-19)
+
+Ran it for real, against a real app, with a stopwatch. Most of this is what that found.
+
+- **The confidence floor is measured now, and it is 0.65, not 0.80.** `scripts/calibrate_choose.py`
+  replays 31 labelled cases — ordinary actions, keyword and destructive-look-alike traps,
+  and screens where the only right move is not to act — at every threshold. With regions
+  supplied, correct answers scored 0.93-0.99 synthetic and 0.74-0.90 on a live 26-row
+  table. The single wrong answer ("cancel without losing my work" -> Save) was wrong nine
+  runs in ten and never rose above 0.58: Jev knows when it is unsure. 0.60 clears that by
+  0.02, which is inside the +-0.08 run-to-run noise, so the floor is 0.65. On the live
+  chain the old floor would have stalled a correct 0.77. `JEV_MIN_CONFIDENCE` overrides
+  it, clamped so it cannot be set down into the band where wrong answers were seen.
+- **`regions` are not redundant.** An audit said they were and suggested dropping them for
+  speed. The same request scored 0.60 without them and 1.00 with them: they are Jev's
+  evidence that the thing is actually on screen. Measure before you optimise.
+- **The installed runner could not import jevkit**, and **could not see a macOS sidebar**
+  (rows are clickable and unlabelled; the label is on a child). Both fixed; pairing now
+  follows the driver's real `parent_index` tree rather than guessing from frame overlap.
+- **Arrival is proved by selection, not existence.** `verify()` accepted any element
+  merely *named* `--expect`, so it passed before the first click. Title-only fixed that
+  but could never pass on a window with no title. "The row named X is the SELECTED row"
+  is true only once you are there.
+- **"Wi\u2011Fi" is spelt with a non-breaking hyphen.** `--expect Wi-Fi` never matched, so
+  a click that landed first time at 0.96 was called unverified and repeated five times.
+- **Rows below the fold are reported to Jev.** Asked for "Sound" with Sound scrolled out of
+  view it scored 0.33 and stalled — correctly, since nothing on the table served the goal.
+  The scroll candidate now names what is further down.
+- **`decision_ms` timed the click, not the decision.** It made a 470 ms Jev call look like
+  2.6 s. Split into `decision_ms` and `action_ms`: Jev is ~12% of a hop; the rest is the
+  driver confirming the click took effect.
+
+Live result, installed copy, six System Settings panes: **3/6 verified in 44.9 s before,
+6/6 verified in 25.2 s after** (4.2 s per hop).
+
 ## 0.10.0 (2026-09-19)
 
 - **The specialization axis was silently dead, and is restored.** Routing pools are two
