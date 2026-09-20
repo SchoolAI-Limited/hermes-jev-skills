@@ -7,11 +7,11 @@ Give your agent a fast, cheap second brain for the small decisions.
 | Skill | What Jev decides | Measured |
 |---|---|---|
 | **Model routing** | Which model is good enough for this turn, from every model you can call | ~0.4 s per turn |
-| **Memory** | Which retrieved passages are worth reading, and which contain hidden instructions | one request for up to 60 passages |
+| **Memory** | Which retrieved passages are worth reading, and which contain hidden instructions | 60 passages per request, up to 480 per call; an injection screen runs locally even when Jev is down |
 | **Compaction and handoffs** | Which turns survive word for word, which get summarized, which are dropped | 71 turns in 0.95 s |
 | **Skill selection** | Which installed skill this turn needs, or none | 377 skills in ~2.8 s; acknowledgements answered locally for free |
 | **Triage** | How urgent a message is, what kind it is, and whether a person must see it | ~0.4 s per message, $0.00006 |
-| **Computer use** | The next GUI action, from a table of actions you already judged safe | ~0.4 s per step |
+| **Computer use** | The next GUI action, from a table of actions you already judged safe. `--plan` splits a multi-step command once, up front | ~0.5 s per decision |
 | **Browser use** | The next page action, same contract | ~0.4 s per step |
 
 Plus a **model routing dashboard** (`jev dashboard`): every profile's models on one page, an on/shadow/off switch for Jev routing, and a live view of where each turn is being sent. See [router-dashboard](router-dashboard/README.md).

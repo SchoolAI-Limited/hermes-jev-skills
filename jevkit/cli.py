@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, catalog, choose, client, compact, key_setup, keystore, ladder, rerank, replay, route, skillpick, spend, supervise, triage
+from . import __version__, catalog, choose, client, compact, key_setup, keystore, ladder, plan, rerank, replay, route, skillpick, spend, supervise, triage
 
 
 def _stdin_json() -> Any:
@@ -49,6 +49,104 @@ def cmd_setup_key(args: argparse.Namespace) -> int:
     return 0 if result.get("status") == "stored" else 1
 
 
+def _catalog_is_cached() -> bool:
+    return any(path.is_file() for path in (catalog.hermes_home() / "models_dev_cache.json",
+                                           catalog.hermes_root() / "models_dev_cache.json", catalog._cache_path()))
+
+
+def _catalog_rows(offline: bool) -> Optional[List[Dict[str, Any]]]:
+    """Catalog prices for the routing checks, or None when they cannot be had."""
+    # --offline is a promise not to touch the network, and the catalog fetches whenever it
+    # has no copy on disk. Read it only if a copy is already there.
+    if offline and not _catalog_is_cached():
+        return None
+    try:
+        return catalog.models()
+    except Exception:  # noqa: BLE001 - doctor reports a problem, it must not become one
+        return None
+
+
+def _names(items: List[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _routing_health(config: Dict[str, Any], rows: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """What the pools cost when they are wrong, as data plus one plain sentence each.
+
+    Everything here is a warning. None of it stops Jev working, so none of it changes the
+    exit code: a config can be expensive and still be a working install.
+    """
+    out: Dict[str, Any] = {}
+    warnings: List[str] = []
+    notes: List[str] = []
+
+    blind = route.dead_axis(config)
+    if blind:
+        out["dead_specialty_axis"] = blind
+        warnings.append(
+            f"tier(s) {', '.join(blind)} have no specialist pools, so the 'what kind of work "
+            f"is this?' question is asked and paid for on every turn and cannot change the "
+            f"answer. Add coding/writing/research pools, or accept the cost knowingly.")
+
+    cells = route.specialty_cells(config)
+    dead = [cell for cell in cells if cell["dead"]]
+    if dead:
+        out["dead_specialty_cells"] = [{k: cell.get(k) for k in ("tier", "specialty", "model", "why")} for cell in dead]
+        # A tier already named above would only be listed a second time here.
+        extra = [f"{cell['tier']}/{cell['specialty']}" for cell in dead if cell["tier"] not in blind]
+        if extra:
+            warnings.append(
+                f"{'beyond that, ' if blind else ''}{len(extra)} of {len(cells)} tier/specialty pools cannot "
+                f"change the model: {_names(extra)}. "
+                f"Each one resolves to the same model its tier's general pool leads with, or is missing and "
+                f"falls through to it, so on those turns Jev's 'what kind of work is this?' answer is paid "
+                f"for and makes no difference. Put a different model first in those pools, or accept the "
+                f"cost knowingly.")
+
+    malformed = route.pool_problems(config)
+    if malformed:
+        out["malformed_pool_entries"] = malformed
+        warnings.append(
+            f"{len(malformed)} part(s) of the pools cannot be read as lists of provider:model and are skipped "
+            f"on every turn, so a model you expect to be in use is not. They are listed under "
+            f"malformed_pool_entries. Copy ids from `jev models list`.")
+
+    prices = route.price_ladder(config, rows if rows is not None else [])
+    # With no catalog a config whose tiers all lead with one model has nothing to compare
+    # and would read "ok". Nothing was checked, so it must not say so.
+    out["price_order"] = "unknown" if rows is None else prices["status"]
+    for found in prices["inversions"]:
+        low, high = found["lower"], found["higher"]
+        times = f"{found['ratio']:.1f}x what" if found["ratio"] else "more than"
+        warnings.append(
+            f"routing down costs more: {low['tier']} leads with {low['model']} at ${low['price']:g} per million "
+            f"tokens, but {high['tier']} leads with {high['model']} at ${high['price']:g} "
+            f"({_names(found['specialties'])} turns). A turn Jev sends down to {low['tier']} costs {times} "
+            f"it would on {high['tier']}. Put a cheaper model first in {low['tier']}.")
+    if prices["inversions"]:
+        out["price_inversions"] = prices["inversions"]
+    for found in prices["delegated"]:
+        low, high = found["lower"], found["higher"]
+        notes.append(
+            f"hard leads with {high['model']} at ${high['price']:g} per million tokens, cheaper than "
+            f"{low['tier']}'s {low['model']} at ${low['price']:g} ({_names(found['specialties'])} turns). "
+            f"Not a fault: the escalation ladder is on, so the hard tier's model drives and the frontier "
+            f"work is delegated through the ladder.")
+    if rows is None:
+        notes.append("the model catalog could not be read, so no pool was price-checked. "
+                     "Tier price order is unknown, not confirmed.")
+    elif prices["unknown"]:
+        out["price_unknown"] = prices["unknown"]
+        notes.append(
+            f"no catalog price for {_names([u['model'] for u in prices['unknown']])}, so the price order "
+            f"of the tiers they lead is unknown, not confirmed.")
+    if warnings:
+        out["warnings"] = warnings
+    if notes:
+        out["notes"] = notes
+    return out
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     report: Dict[str, Any] = {"version": __version__, "key": keystore.describe()}
     if report["key"]["present"] and not args.offline:
@@ -65,15 +163,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                          # to "is routing on?", which it has never been.
                          "privacy_mode": config["mode"],
                          "tiers_configured": sorted(config.get("tiers") or {})}
-    blind = route.dead_axis(config)
-    if blind:
-        report["routing"]["dead_specialty_axis"] = blind
-        report["routing"]["warning"] = (
-            f"tier(s) {', '.join(blind)} have no specialist pools, so the 'what kind of work "
-            f"is this?' question is asked and paid for on every turn and cannot change the "
-            f"answer. Add coding/writing/research pools, or accept the cost knowingly.")
+    if config.get("tiers"):
+        try:
+            report["routing"].update(_routing_health(config, _catalog_rows(args.offline)))
+        except Exception as error:  # noqa: BLE001 - a routing.json odd enough to break a check is itself the finding
+            report["routing"]["warnings"] = [f"the routing checks could not run ({type(error).__name__}); "
+                                             f"the pools were NOT checked. Look at {route.config_path()}."]
     report["hermes_home"] = str(catalog.hermes_home()) if catalog.hermes_home().is_dir() else None
     _out(report)
+    # Only a missing key fails doctor. The routing findings are warnings about cost: an
+    # install script that gates on this exit code must not fail because a pool is pricey.
     return 0 if report["key"]["present"] else 1
 
 
@@ -132,6 +231,13 @@ def cmd_choose(args: argparse.Namespace) -> int:
         return _out(choose.choose(_stdin_json(), mock=args.mock))
     except ValueError as error:
         raise SystemExit(f"invalid request: {error}") from None
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Plan a spoken-style command once, up front. Falls back to a single goal step, never raises."""
+    command = " ".join(args.command).strip() if args.command else str(_stdin_json().get("command", "")).strip()
+    return _out(plan.plan(command, front_app=args.front_app or "", running_apps=args.running or [],
+                          timeout=args.timeout))
 
 
 def _rungs(config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -261,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hermes-home")
     p.set_defaults(func=cmd_setup_key)
 
-    p = sub.add_parser("doctor", help="is the key present and does Jev answer")
+    p = sub.add_parser("doctor", help="is the key present, does Jev answer, and do the routing pools waste money")
     p.add_argument("--offline", action="store_true")
     p.set_defaults(func=cmd_doctor)
 
@@ -299,6 +405,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("choose", help="pick the next GUI or browser action from a candidate table")
     p.add_argument("--mock", action="store_true")
     p.set_defaults(func=cmd_choose)
+
+    p = sub.add_parser("plan", help="break one computer-use command into steps, once, before the Jev loop starts")
+    p.add_argument("command", nargs="*", help='the command; omit to read {"command": ...} from stdin')
+    p.add_argument("--front-app", default="", help="the app in front right now, if known")
+    p.add_argument("--running", action="append", help="a running app (repeatable)")
+    p.add_argument("--timeout", type=float, default=plan.DEFAULT_TIMEOUT)
+    p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("triage", help="classify incoming messages: now / today / queue / ignore")
     p.add_argument("--file", help="JSON list of messages (subject, content, sender); else read stdin")

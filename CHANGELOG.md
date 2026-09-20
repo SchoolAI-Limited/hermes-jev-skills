@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.13.0 (2026-09-19)
+
+A hardening pass: five reviewers were each told to break one area, and everything below is
+something they broke. Nothing here adds a capability you have to turn on.
+
+**Security and privacy**
+
+- **A real person's name and real customer correspondence were in this public repo.** They
+  came in through a test fixture and two docs, copied from a live system while debugging
+  it. They are removed from the tree. They are still in the git history before `8ac177c`.
+  `scripts/check_release.py` now reads a denylist kept *outside* the repo
+  (`~/.config/jev/release-denylist.txt`, or `JEV_RELEASE_DENYLIST`) and reports the file and
+  the rule number, never the string. It caught two more references the first time it ran.
+- **The memory filter dropped its injection screen exactly when it was needed.** With Jev
+  unreachable it returned the head of the list untouched and called that fail-open. The
+  local pattern screen now runs on every path, including that one. A new `screening` field
+  says what actually checked the passages: `jev+local`, `local-only` or `none`. URL
+  exfiltration patterns are screened too.
+- **The tool told agents a dropped passage was kept.** `jev_memory_filter`'s description
+  said unjudged ids stay selected; the code removes the ones the screen caught. An agent
+  believes the description. Both now agree and a test pins the sentence to the behaviour.
+- **A confidential handoff ended by saying "Do not lose identifiers".** That sentence was
+  appended after the confidentiality rules whenever a previous capsule existed — which is
+  also where an old identifier is most likely to be hiding. Under `confidential=True` it
+  now says the opposite.
+
+**Memory**
+
+- `rerank` batches: 60 passages per request, up to 480 per call. The Hermes tool schema
+  still capped the array at 60, so the new capacity could not be reached from the only
+  place agents call it. Raised to match, and pinned to `rerank.MAX_CANDIDATES`.
+- `clipped_ids` and `truncated` report what was cut rather than cutting silently; `top_k`
+  is clamped; `today` can be passed so date-relative passages are judged correctly.
+
+**Skill selection**
+
+- **The free "is this just an acknowledgement?" gate skipped every non-Latin turn.** A
+  request in Japanese, Arabic or Cyrillic had no Latin words, so it looked empty and no
+  skill was ever offered. It also treated "ok deploy it" as an acknowledgement because it
+  started with one. Rewritten: scripts are handled, imperatives are separated from
+  acknowledgements, and anything with a `?` is never trivial.
+- More skills than `MAX_SKILLS` is now reported instead of silently truncated.
+  `discover_roots()` finds the skill directories for a Hermes home, profile-scoped or not.
+
+**Routing**
+
+- `jev doctor` now says what the pools cost when they are wrong: `dead_specialty_cells`
+  (a specialist pool that leads with the model `general` already leads with, so Jev's
+  answer cannot change the pick), `price_order` / `price_inversions` (routing *down* that
+  costs more), `price_unknown`, and `malformed_pool_entries`. With no catalog the price
+  order reads `unknown`, never `ok`. All of it is warnings; none of it changes the exit code.
+- The dashboard agrees with it. It used to judge whole tiers, so a tier with a coding pool
+  that led with general's model looked healthy on the page and dead in `jev doctor`.
+  `dead_cells` is now on the grid and the page names the same cells.
+- The route log records `has_images` and `escalate`, so a shadow run can be audited for
+  both without replaying it.
+
+**Handoffs (Hermes plugin 0.3.0)**
+
+- **The plugin's dispatch hook never fired.** It was written against keyword names the
+  gateway does not pass. It now accepts the real ones (`event`, `gateway`,
+  `session_store`). Absence of errors had been read as proof it worked.
+- The slash command is **`/wrapup`**; `/handoff` collided with a built-in. Saying
+  "handoff" still works.
+- The capsule is built on a background thread with a 30 s export timeout, so a slow
+  export cannot hold the turn. A profile that needs confidentiality on a Hermes that
+  cannot honour it refuses with `confidential_unsupported` rather than writing a capsule
+  in the clear. Checking for the `CONFIDENTIAL` marker no longer creates the directory.
+- `nightly-handoff.py`: one capsule per lane from its newest session, the root home
+  included as profile `default`, cron sessions skipped, `--confidential`, and a
+  `--dry-run` that really writes nothing.
+
+**Computer use**
+
+- **`jev plan` / `--plan`**: one small text-model call splits "open Notes and type the
+  shopping list" into steps before the Jev loop starts; direct steps (open an app, open a
+  URL, a menu path, a key) skip the loop entirely. It fails open to a single goal step. The
+  never-send rule is enforced in code, not in the prompt. Plan-once is the design of
+  [jev-use](https://github.com/savka777/jev-use) (MIT), credited in the source.
+- A missing `cua-driver` exits 2 with one sentence, not a traceback.
+
+**Tests:** 537 (467 in `tests/`, 70 in `router-dashboard/tests/`). Release gate clean.
+
 ## 0.12.1 (2026-09-19)
 
 - **The browser runner died the first time Jev chose to type.** The TypeSafe key fell back

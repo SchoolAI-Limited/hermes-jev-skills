@@ -12,6 +12,15 @@ Usage:
     --goal 'Open the Library page in YouTube Music' \
     --expect 'Library' --max-steps 12 --json
 
+With --plan, a multi-step command is split once by a small text model (jevkit/plan.py)
+and each step is either run directly (open an app, open an address, press a key, invoke a
+menu, scroll, wait) or handed to the same loop as a one-action goal. --pid and --window-id
+become optional, because a command that opens an app cannot know its window beforehand:
+
+  python3 jev_gui_agent.py --plan \
+    --goal 'Open System Settings, go to General and then open Storage' \
+    --expect 'Storage' --json
+
 Exit codes: 0 verified, 4 unverified, 2 refused to start, 6 abstained.
 """
 from __future__ import annotations
@@ -19,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -74,6 +84,20 @@ except Exception:  # noqa: BLE001
     def is_sensitive(text: str) -> bool:  # type: ignore[misc]
         return False
 
+try:
+    from jevkit.choose import MIN_CONFIDENCE as JEV_FLOOR
+except Exception:  # noqa: BLE001
+    JEV_FLOOR = 0.65
+
+# Imported on its own. The installer vendors jevkit into the Hermes plugin, so a newer
+# copy of this script can meet an older jevkit that has `choose` and no `plan`. That must
+# cost the --plan speed-up and nothing else; folded into the import above it would have
+# reported "jevkit not importable" and refused to run at all.
+try:
+    from jevkit import plan as jev_plan
+except Exception:  # noqa: BLE001
+    jev_plan = None
+
 
 def _find_driver() -> str:
     """Locate cua-driver without baking anyone's home directory into the repo.
@@ -121,21 +145,38 @@ MAX_REGIONS = MAX_CANDIDATES - len(STANDARD_ACTIONS)
 # ---------------------------------------------------------------- MCP client
 
 
+class DriverError(RuntimeError):
+    """The driver could not be started. main() turns this into exit 2, not a traceback."""
+
+
 class Driver:
     """Minimal MCP stdio client for cua-driver."""
 
     def __init__(self, binary: str = CUA) -> None:
-        self.proc = subprocess.Popen(
-            [binary, "mcp", "--no-daemon-relaunch"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
-        )
+        # On a machine without cua-driver this raised FileNotFoundError straight through
+        # main(): a traceback and exit code 1, where the docstring promises "2 refused to
+        # start". A caller that branches on the exit code read a missing install as a crash.
+        try:
+            self.proc = subprocess.Popen(
+                [binary, "mcp", "--no-daemon-relaunch"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except OSError as exc:
+            raise DriverError(f"cannot start {binary!r} ({exc.strerror or exc}). "
+                              "Install cua-driver or point CUA_DRIVER_BIN at it.") from None
         self._id = 0
-        self.call("initialize", {
+        hello = self.call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "jev-gui-agent", "version": "0.1.0"},
-        })
+        }, timeout=20.0)
+        # A binary that starts and is not an MCP server (wrong file, a build that exits on
+        # launch) answers nothing. Every later call would fail the same way and the run
+        # would end as "unverified", which blames the screen for a broken install.
+        if "result" not in hello:
+            self.stop()
+            raise DriverError(f"{binary!r} started but did not answer the MCP handshake.")
         self._notify("notifications/initialized")
 
     def _send(self, obj: dict) -> None:
@@ -144,12 +185,21 @@ class Driver:
         self.proc.stdin.flush()
 
     def _notify(self, method: str) -> None:
-        self._send({"jsonrpc": "2.0", "method": method})
+        try:
+            self._send({"jsonrpc": "2.0", "method": method})
+        except OSError:
+            pass      # the driver has gone; the next call() reports it
 
     def call(self, method: str, params: dict, timeout: float = 90.0) -> dict:
         self._id += 1
         mid = self._id
-        self._send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
+        try:
+            self._send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
+        except OSError:
+            # Writing to a process that has already exited is a BrokenPipeError. Without
+            # this the handshake check above is a race: a binary that quits at once fails
+            # here with a traceback before its missing reply can be noticed.
+            return {"error": {"message": "driver exited"}}
         assert self.proc.stdout is not None
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -426,8 +476,14 @@ def text_helper(goal: str, field_label: str, values: list[str]) -> str:
 
 
 def execute(driver: Driver, pid: int, window_id: int, session: str,
-            action: str, rows: list[dict], goal: str, values: list[str]) -> tuple[str, str]:
-    """Run exactly one pre-validated action. Returns (op, detail)."""
+            action: str, rows: list[dict], goal: str, values: list[str],
+            literal: str = "") -> tuple[str, str]:
+    """Run exactly one pre-validated action. Returns (op, detail).
+
+    ``literal`` is the text of a planned type_text step. The person dictated it, so it is
+    typed as given; asking the text model to choose a value would add a second model call
+    to the step whose whole purpose is to save one.
+    """
     if action.startswith("click:"):
         token = next((r["token"] for r in rows if r.get("cid") == action), None)
         for r in rows:
@@ -442,7 +498,7 @@ def execute(driver: Driver, pid: int, window_id: int, session: str,
         token = next((r["token"] for r in rows if r.get("cid") == action), None)
         for r in rows:
             if r["token"] == token:
-                text = text_helper(goal, r["label"], values)
+                text = literal or text_helper(goal, r["label"], values)
                 res = driver.tool("type_text", with_session({
                     "pid": pid, "window_id": window_id,
                     "element_token": token, "text": text,
@@ -462,13 +518,38 @@ def execute(driver: Driver, pid: int, window_id: int, session: str,
     return action, "no-op"
 
 
+def _failure(res: dict) -> str:
+    """Empty when a driver call worked, otherwise the reason. The driver fails closed and
+    says so in the result body, not as a JSON-RPC error, so both places are read."""
+    if not isinstance(res, dict):
+        return "no reply from the driver"
+    if res.get("error"):
+        err = res["error"]
+        return str(err.get("message") if isinstance(err, dict) else err)[:160]
+    out = res.get("result") or {}
+    if out.get("isError"):
+        text = next((c.get("text") for c in out.get("content") or []
+                     if isinstance(c, dict) and c.get("text")), "")
+        return (text or "the driver refused the call")[:160]
+    return ""
+
+
 def _brief(res: dict) -> dict:
     out = res.get("result", {}) if isinstance(res, dict) else {}
     sc = out.get("structuredContent") or {}
+    # The message used to be read from `result.result`, a field the driver never sets, so
+    # a refused click was logged as {"effect": "refused", "message": ""} and the one line
+    # that said why was thrown away. The reason is in the content text.
+    why = _failure(res)
     return {
-        "effect": sc.get("effect", out.get("status", "unknown")),
-        "message": str(out.get("result") or res.get("error") or "")[:120],
+        "effect": sc.get("effect") or ("refused" if why else out.get("status", "unknown")),
+        "message": (why or str(out.get("result") or ""))[:120],
     }
+
+
+def _landed(detail: str) -> bool:
+    """Did the action reach the app? A refusal or a vanished element is not a completed step."""
+    return "no longer observed" not in detail and '"effect": "refused"' not in detail
 
 
 _DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")
@@ -514,14 +595,452 @@ def verify(rows: list[dict], title: str, expect: str) -> bool:
     return any(r.get("selected") and needle in _fold(r.get("label", "")) for r in rows)
 
 
+# ---------------------------------------------------------------- the loop
+
+
+def run_goal(driver: Driver, pid: int, window_id: int, session: str, goal: str, *,
+             expect: str, values: list[str], regions_cap: int, budget: int,
+             first_step: int = 1, history: list[dict] | None = None,
+             log: list[dict] | None = None, until_op: str = "", literal: str = "") -> dict:
+    """observe -> choose -> act for ONE goal, until it ends or ``budget`` Jev calls are spent.
+
+    Without --plan this is the whole run, called once. With --plan it is called for each
+    step that needs an on-screen target, with ``until_op`` naming the operation that
+    completes the step ("click" or "type"). A planned step is one action, so the loop
+    returns as soon as that action is delivered instead of spending another observation
+    and another Jev call on being told "done".
+    """
+    tokens = goal_tokens(goal)
+    history = [] if history is None else history
+    log = [] if log is None else log
+    out: dict = {"used": 0, "abstained": False, "ended": "budget", "title": "", "rows": []}
+    stalled = 0
+    last_digest: str | None = None
+    for step in range(first_step, first_step + budget):
+        state = observe(driver, pid, window_id, session)
+        out["title"] = state.get("window_title", "")
+        rows = out["rows"] = element_rows(state, regions_cap, tokens)
+        if not rows:
+            print(f"  step {step}: no interactive elements observed")
+            out["ended"] = "nothing_observed"
+            break
+        safe_rows = [r for r in rows if not is_sensitive(r["label"])]
+        withheld = len(rows) - len(safe_rows)
+        if withheld:
+            print(f"  step {step}: withheld {withheld} label(s) that look sensitive")
+        rows = out["rows"] = safe_rows
+        if not rows:
+            print("  every observed label looks sensitive; stopping")
+            out["abstained"] = True
+            out["ended"] = "all_sensitive"
+            break
+        digest = "|".join(f"{r['label'][:40]}@{int(r['x'])},{int(r['y'])}" for r in rows)
+        stalled = stalled + 1 if digest == last_digest else 0
+        last_digest = digest
+        if expect and verify(rows, out["title"], expect):
+            print(f"  verified before step {step}; stopping")
+            out["ended"] = "verified"
+            break
+        regions, candidates = build_table(rows, offscreen_matches(state, tokens))
+        request = {
+            "schema": "jev.action_choice_request_v1",
+            "goal": goal,
+            "observation_id": f"obs-{step}",
+            "regions": regions,
+            "history": history[-6:],
+            "candidates": candidates,
+        }
+        try:
+            t_jev = time.time()
+            reply = jev_choose(request)
+            jev_ms = int((time.time() - t_jev) * 1000)
+        except ValueError as exc:
+            print(f"  step {step}: request rejected by the Jev contract: {exc}")
+            out["ended"] = "contract_rejected"
+            break
+        action = reply.get("selected_id", "reobserve")
+        confidence = reply.get("confidence")
+        out["used"] = step - first_step + 1
+        if action in ("done", "abstain"):
+            print(f"  step {step:>2}  Jev -> {action} "
+                  f"(conf {confidence}) {reply.get('reason','')}")
+            out["abstained"] = action == "abstain"
+            out["ended"] = action
+            history.append({"selected_id": action, "outcome": "loop ended"})
+            break
+        if until_op == "click" and action == "reobserve" and _already_there(reply, rows):
+            print(f"  step {step:>2}  the target is already the selected item; nothing to do")
+            out["ended"] = "done"
+            history.append({"selected_id": "done", "outcome": "already selected"})
+            break
+        if action == "reobserve" and stalled >= 2:
+            print(f"  step {step:>2}  nothing on screen is changing after "
+                  f"{stalled} reobservations; stopping instead of spinning")
+            out["ended"] = "stalled"
+            break
+        t1 = time.time()
+        op, detail = execute(driver, pid, window_id, session, action, rows, goal, values, literal)
+        action_ms = int((time.time() - t1) * 1000)
+        print(f"  step {step:>2}  jev {jev_ms:>4} ms + act {action_ms:>4} ms  op={op}  "
+              f"conf={confidence}  {detail[:100]}")
+        # These were one field called `decision_ms` that actually timed the CLICK. It
+        # made a 470 ms Jev decision look like 2.6 s and sent the latency hunt after
+        # the wrong component: the time is the driver confirming the click's effect.
+        log.append({"step": step, "action": action, "op": op,
+                    "detail": detail, "confidence": confidence,
+                    "decision_ms": jev_ms, "action_ms": action_ms})
+        what = next((f'{r["role"].replace("AX", "").lower()} "{single_line(r["label"], 40)}"'
+                     for r in rows if r.get("cid") == action), action)
+        history.append({"selected_id": action,
+                        "outcome": f"{op} {what} - {single_line(detail, 60)}"})
+        if op == "no-op":
+            time.sleep(0.3)
+        if until_op and op == until_op and _landed(detail):
+            out["ended"] = "acted"
+            break
+    return out
+
+
+def _already_there(reply: dict, rows: list[dict]) -> bool:
+    """A planned step whose target is already the selected item needs no action.
+
+    Found live: "Open System Settings, go to General..." with General already showing.
+    The table tells Jev the General row is selected and that clicking it changes nothing,
+    so it split 0.66 on the click and 0.14 on `done`. Both answers are right, neither
+    clears the floor alone, and the step stalled on a screen that was already correct.
+    When the mass on "that selected row" plus `done` clears the floor, the step is over.
+    This only ever resolves to NOT acting: if it is wrong, the next step cannot find its
+    target and the plan stops, which is the same outcome as the stall it replaces.
+    """
+    probabilities = reply.get("probabilities") or {}
+    if not probabilities:
+        return False
+    selected = {r.get("cid") for r in rows if r.get("selected")}
+    top = max(probabilities, key=lambda cid: probabilities[cid])
+    if top != "done" and top not in selected:
+        return False
+    mass = sum(p for cid, p in probabilities.items() if cid == "done" or cid in selected)
+    return mass >= JEV_FLOOR
+
+
+# ---------------------------------------------------------------- planned steps
+
+OPEN = "/usr/bin/open"
+DIRECT_KINDS = ("open_app", "open_url", "press_key", "menu", "scroll", "wait")
+# type_text is Jev-driven on purpose. Typing at "wherever the focus happens to be" looks
+# like a harmless shortcut and is not: with no field focused, a web app reads each letter
+# as a keyboard command, and in a mail client those archive and delete. The text only
+# ever goes into a field Jev picked from the table.
+JEV_KINDS = {"click": "click", "type_text": "type"}
+# The driver draws its agent cursor in a window of its own that is always on top, so
+# "the frontmost window" would otherwise always be the driver's overlay.
+_DRIVER_APPS = {"cua driver"}
+
+
+def list_windows(driver: Driver) -> list[dict]:
+    res = driver.tool("list_windows", {}, timeout=15)
+    found = (res.get("result", {}).get("structuredContent") or {}).get("windows") or []
+    return [w for w in found if _fold(w.get("app_name", "")) not in _DRIVER_APPS]
+
+
+def _frontness(window: dict) -> tuple[bool, int]:
+    visible = bool(window.get("is_on_screen")) and window.get("on_current_space") is not False
+    z = window.get("z_index")
+    return visible, z if isinstance(z, int) and not isinstance(z, bool) else -1
+
+
+def front_window(windows: list[dict]) -> dict | None:
+    return max(windows, key=_frontness, default=None)
+
+
+def window_of(windows: list[dict], app_name: str) -> dict | None:
+    """The app's frontmost window. "Chrome" finds "Google Chrome"; nothing finds nothing."""
+    want = _fold(app_name)
+    names = [(w, _fold(w.get("app_name", ""))) for w in windows]
+    exact = [w for w, name in names if name == want]
+    loose = [w for w, name in names if name and want and (want in name or name in want)]
+    return front_window(exact or loose)
+
+
+def wait_for_window(driver: Driver, app_name: str, timeout: float = 8.0, sleep=time.sleep) -> dict | None:
+    """The window of the app a direct op just opened, so the next step knows where to act."""
+    found = None
+    # Counted polls rather than a wall-clock deadline, so the wait is exactly as long as
+    # the sleeps it was given. A listing costs about 3 ms on top.
+    for attempt in range(max(1, int(timeout / 0.4)) + 1):
+        if attempt:
+            sleep(0.4)
+        found = window_of(list_windows(driver), app_name)
+        if found is not None and _frontness(found)[0]:
+            return found
+    return found
+
+
+def default_browser() -> str:
+    """The bundle id this Mac opens https links with, "" when it cannot be read."""
+    prefs = (Path.home() / "Library" / "Preferences" / "com.apple.LaunchServices"
+             / "com.apple.launchservices.secure.plist")
+    try:
+        with open(prefs, "rb") as handle:
+            handlers = plistlib.load(handle).get("LSHandlers") or []
+    except Exception:  # noqa: BLE001 - a missing or unreadable plist only costs the shortcut
+        return ""
+    for handler in handlers:
+        if handler.get("LSHandlerURLScheme") in ("https", "http") and handler.get("LSHandlerRoleAll"):
+            return str(handler["LSHandlerRoleAll"]).lower()
+    return "com.apple.safari"      # nobody ever chose one
+
+
+def window_after_open_url(driver: Driver, before: dict, browser: str | None = None,
+                          timeout: float = 3.0, sleep=time.sleep) -> dict | None:
+    """Which window did the address open in? Nobody said which browser.
+
+    The first version took "whatever is in front afterwards". Live, `open` loaded the page
+    in a browser window BEHIND the front app: a background process is not always allowed
+    to take focus, so the front window was still System Settings and the next step would
+    have clicked there. So ask the OS which app handles https and use that app's window.
+    If that cannot be answered, accept only a window that visibly changed (it is new, or
+    its title is not what it was before the open); never the front window on faith.
+    """
+    bundle = default_browser() if browser is None else browser
+    pids: set = set()
+    if bundle:
+        # list_apps is the only call that maps a bundle id to a pid. It costs about 0.75 s
+        # because it also scans installed apps, which is why it is asked once, here, and
+        # nowhere else in a run.
+        res = driver.tool("list_apps", {}, timeout=20)
+        apps = (res.get("result", {}).get("structuredContent") or {}).get("apps") or []
+        pids = {a.get("pid") for a in apps
+                if str(a.get("bundle_id") or "").lower() == bundle and a.get("running") and a.get("pid")}
+    for attempt in range(max(1, int(timeout / 0.4)) + 1):
+        if attempt:
+            sleep(0.4)
+        windows = list_windows(driver)
+        mine = [w for w in windows if w.get("pid") in pids]
+        # A browser that was not running yet has no pid above; its new window shows up
+        # here as one that did not exist before the open.
+        changed = [w for w in windows if before.get(w.get("window_id")) != (w.get("title") or "")]
+        if mine or changed:
+            return front_window(mine or changed)
+    return None
+
+
+def _aim(driver: Driver, where: dict) -> bool:
+    """Make sure there is a window to act on. A spoken-style command means the front one."""
+    if where.get("pid") is not None and where.get("window_id") is not None:
+        return True
+    front = front_window(list_windows(driver))
+    if front is None:
+        return False
+    where["pid"], where["window_id"] = front.get("pid"), front.get("window_id")
+    return True
+
+
+def run_direct(driver: Driver, where: dict, session: str, step: dict,
+               opener=subprocess.run, sleep=time.sleep, browser: str | None = None) -> tuple[bool, str]:
+    """One step that needs no on-screen target. Returns (ok, detail).
+
+    ``step`` has been through jevkit.plan.clean_step, and every value is checked again
+    here at the point of use: this is the function that hands a model-written string to
+    the operating system.
+    """
+    kind = step.get("kind")
+    if kind in ("open_app", "open_url"):
+        if sys.platform != "darwin":
+            return False, f"{kind} is only wired for macOS"
+        if kind == "open_app":
+            name = jev_plan.safe_app_name(step.get("target"))
+            if not name:
+                return False, "refused: not an application name"
+            command, before = [OPEN, "-a", name], {}
+        else:
+            url = jev_plan.safe_url(step.get("target"))
+            if not url:
+                return False, "refused: only http and https addresses are opened"
+            before = {w.get("window_id"): w.get("title") or "" for w in list_windows(driver)}
+            command, name = [OPEN, url], ""
+        try:
+            proc = opener(command, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"open failed: {exc}"
+        if proc.returncode != 0:
+            return False, f"open failed: {single_line(proc.stderr or '', 120)}"
+        window = (wait_for_window(driver, name, sleep=sleep) if name
+                  else window_after_open_url(driver, before, browser=browser, sleep=sleep))
+        if window is None:
+            return False, "opened, but no window appeared to act on"
+        where["pid"], where["window_id"] = window.get("pid"), window.get("window_id")
+        return True, f"window {window.get('window_id')} of {window.get('app_name', '')!r}"
+    if kind == "wait":
+        seconds = min(10, max(1, int(step.get("amount") or 1)))
+        sleep(seconds)
+        return True, f"slept {seconds}s"
+    if not _aim(driver, where):
+        return False, "no window to act on"
+    base = {"pid": where["pid"], "window_id": where["window_id"]}
+    if kind == "press_key":
+        keys = jev_plan.parse_keys(step.get("target"))
+        if not keys:
+            return False, "refused: not a key on the allowlist"
+        modifiers, key = keys
+        # Foreground, like type_text: the key has to reach whatever field the previous
+        # step focused, and a background post does not reach Chromium content or a
+        # native menu equivalent.
+        if modifiers:
+            res = driver.tool("hotkey", with_session(
+                dict(base, keys=modifiers + [key], delivery_mode="foreground"), session))
+        else:
+            res = driver.tool("press_key", with_session(
+                dict(base, key=key, delivery_mode="foreground"), session))
+    elif kind == "menu":
+        path = jev_plan.menu_path(step.get("target"))
+        if not path:
+            return False, "refused: not a menu path"
+        res = driver.tool("invoke_menu", with_session(dict(base, path=path), session))
+    elif kind == "scroll":
+        direction = str(step.get("target") or "")
+        if direction not in ("up", "down", "left", "right"):
+            return False, "refused: not a scroll direction"
+        times = min(20, max(1, int(step.get("amount") or 1)))
+        # 6 notches is what one scroll action moves in the loop above; the driver caps at 50.
+        res = driver.tool("scroll", with_session(
+            dict(base, direction=direction, amount=min(50, 6 * times)), session))
+    else:
+        return False, f"refused: {kind!r} is not a direct operation"
+    why = _failure(res)
+    return (False, why) if why else (True, json.dumps(_brief(res)))
+
+
+def run_plan(driver: Driver, where: dict, args: argparse.Namespace, values: list[str],
+             regions_cap: int, *, planner=None, opener=subprocess.run, sleep=time.sleep) -> dict:
+    """Plan once, then run each step directly or through the Jev loop.
+
+    Returns what run_goal returns, plus ``report`` for the --json result. ``--max-steps``
+    stays the ceiling on Jev calls for the WHOLE command, not per step, so a plan cannot
+    turn a bounded run into steps x budget.
+    """
+    windows = list_windows(driver)
+    front = front_window(windows)
+    running: list[str] = []
+    for window in sorted(windows, key=_frontness, reverse=True):
+        name = str(window.get("app_name") or "")
+        if name and name not in running:
+            running.append(name)
+    try:
+        planned = (planner or jev_plan.plan)(
+            args.goal, front_app=str((front or {}).get("app_name") or ""), running_apps=running)
+    except Exception as exc:  # noqa: BLE001 - plan() promises not to raise; the run must not depend on it
+        planned = {"status": "fallback", "reason": f"planner_error:{type(exc).__name__}",
+                   "steps": [{"kind": "goal"}]}
+    if not isinstance(planned, dict) or not planned.get("steps"):
+        planned = {"status": "fallback", "reason": "no_plan", "steps": [{"kind": "goal"}]}
+    status = planned.get("status", "fallback")
+    why = f" ({planned['reason']})" if planned.get("reason") else ""
+    print(f"  plan: {status}{why}, {len(planned.get('steps') or [])} step(s), "
+          f"{planned.get('latency_ms', 0)} ms")
+
+    # The plan is checked again here, whoever produced it. A step outside the vocabulary
+    # is ignored and reported, never executed.
+    records: list[dict] = []
+    runnable: list[dict] = []
+    whole_goal = False
+    for raw in planned.get("steps") or []:
+        if isinstance(raw, dict) and raw.get("kind") == "goal":
+            whole_goal = True
+            continue
+        step = jev_plan.clean_step(raw)
+        if step is None:
+            kind = str(raw.get("kind"))[:40] if isinstance(raw, dict) else "?"
+            records.append({"kind": kind, "target": "", "mode": "ignored", "ok": False,
+                            "duration_ms": 0,
+                            "detail": "not a step this runner knows how to run safely"})
+            print(f"  plan step ignored: {kind!r} is not in the vocabulary")
+            continue
+        runnable.append(step)
+    dropped = list(planned.get("dropped") or [])
+    if whole_goal:
+        # The fallback always means "the goal the person gave", run as one loop exactly
+        # as it would be without --plan. Its own text is never read: a plan that could
+        # put words in the goal step could put a different goal in front of Jev.
+        runnable = [{"kind": "goal"}]
+    else:
+        runnable, cut = jev_plan.enforce_never_send(args.goal, runnable)
+        dropped += cut
+        for item in cut:
+            print(f"  plan step dropped: {item['step'].get('kind')} "
+                  f"{item['step'].get('target', '')!r} - {item['reason']}")
+
+    out: dict = {"used": 0, "abstained": False, "ended": "planned", "title": "", "rows": []}
+    history: list[dict] = []
+    log: list[dict] = []
+    stopped = ""
+    for index, step in enumerate(runnable, 1):
+        kind = step["kind"]
+        record = {"kind": kind, "target": step.get("target", ""),
+                  "mode": "direct" if kind in DIRECT_KINDS else "jev"}
+        if step.get("risky"):
+            record["risky"] = step["risky"]
+        if stopped:
+            records.append(dict(record, mode="not_run", ok=False, duration_ms=0, detail=stopped))
+            continue
+        t0 = time.time()
+        if kind in DIRECT_KINDS:
+            ok, detail = run_direct(driver, where, args.session, step, opener=opener, sleep=sleep)
+        else:
+            remaining = args.max_steps - out["used"]
+            if remaining <= 0:
+                ok, detail = False, "the --max-steps budget is spent"
+            elif not _aim(driver, where):
+                ok, detail = False, "no window to act on"
+            else:
+                whole = kind == "goal"
+                part = run_goal(
+                    driver, where["pid"], where["window_id"], args.session,
+                    args.goal if whole else jev_plan.step_goal(step),
+                    expect=args.expect, values=values, regions_cap=regions_cap,
+                    budget=remaining, first_step=out["used"] + 1, history=history, log=log,
+                    until_op="" if whole else JEV_KINDS[kind],
+                    literal="" if whole else str(step.get("text") or ""))
+                out["used"] += part["used"]
+                out["abstained"] = out["abstained"] or part["abstained"]
+                out["title"], out["rows"] = part["title"], part["rows"]
+                record["jev_calls"] = part["used"]
+                ok = part["ended"] in ("acted", "done", "verified")
+                detail = part["ended"]
+                if part["ended"] == "verified":
+                    stopped = "the expected end state was already reached"
+        record.update(ok=ok, duration_ms=int((time.time() - t0) * 1000), detail=single_line(detail, 160))
+        records.append(record)
+        print(f"  plan step {index}/{len(runnable)}  {kind:<9} {record['mode']:<6} "
+              f"{record['duration_ms']:>5} ms  {'ok' if ok else 'FAILED'}  {record['detail'][:80]}")
+        # Later steps were planned on the assumption that this one happened. Typing into
+        # a window that failed to open is how text ends up somewhere it was never meant
+        # to go, so a failed step ends the plan.
+        if not ok and not stopped:
+            stopped = f"step {index} ({kind}) did not complete"
+    out["log"] = log
+    out["report"] = {
+        "status": status, "reason": planned.get("reason", ""),
+        "latency_ms": planned.get("latency_ms", 0), "model": planned.get("model", ""),
+        "dropped": [{"kind": d.get("step", {}).get("kind"), "target": d.get("step", {}).get("target", ""),
+                     "reason": d.get("reason", "")} for d in dropped if isinstance(d, dict)],
+        "steps": records,
+    }
+    return out
+
+
 # ---------------------------------------------------------------- main
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Bounded GUI computer-use loop: cua-driver + Jev")
-    p.add_argument("--pid", type=int, required=True)
-    p.add_argument("--window-id", type=int, required=True)
+    p.add_argument("--pid", type=int, default=None)
+    p.add_argument("--window-id", type=int, default=None)
     p.add_argument("--goal", required=True)
+    p.add_argument("--plan", action="store_true",
+                   help="Split a multi-step command into atomic steps with one text-model "
+                        "call, run the deterministic ones directly and the rest through "
+                        "Jev. Makes --pid and --window-id optional.")
     p.add_argument("--max-steps", type=int, default=10)
     p.add_argument("--max-regions", type=int, default=MAX_REGIONS,
                    help=f"Element rows offered to Jev (max {MAX_REGIONS}: build_table "
@@ -533,6 +1052,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="Optional cua-driver session label (omit when the transport has none).")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
+    # Only a plan can find its own window (it may be the one that opens the app), so the
+    # plain loop still refuses to start without both, exactly as when they were required.
+    missing = [flag for flag, value in (("--pid", args.pid), ("--window-id", args.window_id))
+               if value is None]
+    if missing and not args.plan:
+        p.error(f"the following arguments are required: {', '.join(missing)}")
     # Above the cap the table is rejected by the contract on EVERY step, at step 1,
     # every time - a flag that silently guarantees total failure is worse than no flag.
     regions_cap = max(1, min(args.max_regions, MAX_REGIONS))
@@ -546,9 +1071,6 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL: the goal looks sensitive; refusing to send it to Jev.")
         return 2
 
-    for k in ("TYPESAFE_API_KEY",):
-        if k in os.environ:
-            continue
     if not os.environ.get("TYPESAFE_API_KEY"):
         tok = subprocess.run(
             ["security", "find-generic-password", "-s", "Hermes TypeSafe API",
@@ -569,100 +1091,45 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL: no TypeSafe credential. Run `jev setup-key`.")
         return 2
 
-    driver = Driver()
-    log: list[dict] = []
-    history: list[dict] = []
-    title = ""
-    rows: list[dict] = []
-    steps = 0
-    abstained = False
+    try:
+        # Resolved now, not at import, so CUA_DRIVER_BIN set by the caller is honoured.
+        driver = Driver(_find_driver())
+    except DriverError as exc:
+        print(f"FAIL: {exc}")
+        return 2
+    use_plan = args.plan
+    if use_plan and jev_plan is None:
+        # Fail open: an older jevkit costs the speed-up, never the run.
+        print("  --plan: this jevkit has no planner; running the goal as one loop instead")
+        use_plan = False
+    where = {"pid": args.pid, "window_id": args.window_id}
+    outcome: dict = {"used": 0, "abstained": False, "title": "", "rows": [], "log": []}
     t0 = time.time()
     try:
         if args.session:
             driver.tool("start_session", {"session": args.session})
-        stalled = 0
-        last_digest: str | None = None
-        for step in range(1, args.max_steps + 1):
-            state = observe(driver, args.pid, args.window_id, args.session)
-            title = state.get("window_title", "")
-            rows = element_rows(state, regions_cap, tokens)
-            if not rows:
-                print(f"  step {step}: no interactive elements observed")
-                break
-            safe_rows = [r for r in rows if not is_sensitive(r["label"])]
-            withheld = len(rows) - len(safe_rows)
-            if withheld:
-                print(f"  step {step}: withheld {withheld} label(s) that look sensitive")
-            rows = safe_rows
-            if not rows:
-                print("  every observed label looks sensitive; stopping")
-                abstained = True
-                break
-            digest = "|".join(f"{r['label'][:40]}@{int(r['x'])},{int(r['y'])}" for r in rows)
-            stalled = stalled + 1 if digest == last_digest else 0
-            last_digest = digest
-            if args.expect and verify(rows, title, args.expect):
-                steps = step - 1
-                print(f"  verified before step {step}; stopping")
-                break
-            regions, candidates = build_table(rows, offscreen_matches(state, tokens))
-            request = {
-                "schema": "jev.action_choice_request_v1",
-                "goal": args.goal,
-                "observation_id": f"obs-{step}",
-                "regions": regions,
-                "history": history[-6:],
-                "candidates": candidates,
-            }
-            try:
-                t_jev = time.time()
-                reply = jev_choose(request)
-                jev_ms = int((time.time() - t_jev) * 1000)
-            except ValueError as exc:
-                print(f"  step {step}: request rejected by the Jev contract: {exc}")
-                break
-            action = reply.get("selected_id", "reobserve")
-            confidence = reply.get("confidence")
-            steps = step
-            if action in ("done", "abstain"):
-                print(f"  step {step:>2}  Jev -> {action} "
-                      f"(conf {confidence}) {reply.get('reason','')}")
-                abstained = action == "abstain"
-                history.append({"selected_id": action, "outcome": "loop ended"})
-                break
-            if action == "reobserve" and stalled >= 2:
-                print(f"  step {step:>2}  nothing on screen is changing after "
-                      f"{stalled} reobservations; stopping instead of spinning")
-                break
-            t1 = time.time()
-            op, detail = execute(driver, args.pid, args.window_id, args.session,
-                                 action, rows, args.goal, values)
-            action_ms = int((time.time() - t1) * 1000)
-            print(f"  step {step:>2}  jev {jev_ms:>4} ms + act {action_ms:>4} ms  op={op}  "
-                  f"conf={confidence}  {detail[:100]}")
-            # These were one field called `decision_ms` that actually timed the CLICK. It
-            # made a 470 ms Jev decision look like 2.6 s and sent the latency hunt after
-            # the wrong component: the time is the driver confirming the click's effect.
-            log.append({"step": step, "action": action, "op": op,
-                        "detail": detail, "confidence": confidence,
-                        "decision_ms": jev_ms, "action_ms": action_ms})
-            what = next((f'{r["role"].replace("AX", "").lower()} "{single_line(r["label"], 40)}"'
-                         for r in rows if r.get("cid") == action), action)
-            history.append({"selected_id": action,
-                            "outcome": f"{op} {what} - {single_line(detail, 60)}"})
-            if op == "no-op":
-                time.sleep(0.3)
-            if not action.startswith(("click:", "type:")):
-                continue
+        if use_plan:
+            outcome = run_plan(driver, where, args, values, regions_cap)
+        elif not _aim(driver, where):
+            print("  no window to act on")
+        else:
+            log: list[dict] = []
+            outcome = run_goal(driver, where["pid"], where["window_id"], args.session, args.goal,
+                               expect=args.expect, values=values, regions_cap=regions_cap,
+                               budget=args.max_steps, log=log)
+            outcome["log"] = log
     finally:
+        title, rows = outcome.get("title", ""), outcome.get("rows", [])
         try:
-            final = observe(driver, args.pid, args.window_id, args.session)
-            title = final.get("window_title", title)
-            rows = element_rows(final, regions_cap, tokens)
+            if where["pid"] is not None and where["window_id"] is not None:
+                final = observe(driver, where["pid"], where["window_id"], args.session)
+                title = final.get("window_title", title)
+                rows = element_rows(final, regions_cap, tokens)
         except Exception:  # noqa: BLE001
             pass
         driver.stop()
 
+    steps, abstained = outcome["used"], outcome["abstained"]
     verified = verify(rows, title, args.expect)
     result = {
         "schema": "hermes.computer_use_jev_run_v1",
@@ -674,8 +1141,10 @@ def main(argv: list[str] | None = None) -> int:
         "verified": verified,
         "abstained": abstained,
         "regions_last": len(rows),
-        "actions": log,
+        "actions": outcome.get("log", []),
     }
+    if "report" in outcome:
+        result["plan"] = outcome["report"]
     print(f"  window_title: {title!r}")
     print(f"  independent check for {args.expect!r}: {'PASS' if verified else 'FAIL'}")
     print(f"  {steps} steps, {result['elapsed_ms']} ms total")

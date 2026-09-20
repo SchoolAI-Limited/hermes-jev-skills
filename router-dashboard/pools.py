@@ -129,6 +129,7 @@ def grid_for(hermes_root: str, profile_home: str) -> dict:
         return sum(grid[tier].get(n, {}).get("usable", 0) for n in names)
 
     dead = [t for t in TIERS if usable(t, SPECIALTIES) and not usable(t, ANSWERABLE)]
+    dead_cells = _dead_cells(grid, dead)
     empty = [t for t in TIERS if not usable(t, SPECIALTIES)]
     configured = any(usable(t, SPECIALTIES) for t in TIERS)
 
@@ -149,15 +150,48 @@ def grid_for(hermes_root: str, profile_home: str) -> dict:
         "exclude": patterns,
         "tiers": grid,
         "dead_tiers": dead,
+        "dead_cells": dead_cells,
         "empty_tiers": empty,
         "unknown_pools": unknown,
         "unknown_tiers": stray,
         "configured": configured,
-        "warnings": _warnings(configured, dead, empty, shadowed, unknown, stray),
+        "warnings": _warnings(configured, dead, empty, shadowed, unknown, stray, dead_cells),
     }
 
 
-def _warnings(configured: bool, dead: list, empty: list, shadowed: list, unknown: list, stray: list) -> list:
+def _lead(cell: dict) -> str:
+    for model in cell.get("models", []):
+        if not model["excluded"]:
+            return model["ref"]
+    return ""
+
+
+def _dead_cells(grid: dict, dead_tiers: list) -> list:
+    """Specialty cells that resolve to the same lead as `general` in their tier.
+
+    A tier could hold a coding pool and still be no better than one that does not, when
+    that pool leads with the model general already leads with. The tier-level warning
+    missed this and `jev doctor` (jevkit/route.py `specialty_cells`) did not, so the two
+    disagreed about the same file. Tiers already reported dead as a whole are skipped
+    here so one fault is not said twice.
+    """
+    cells = []
+    for tier in TIERS:
+        if tier in dead_tiers:
+            continue
+        general = _lead(grid[tier].get("general", {}))
+        if not general:
+            continue
+        for name in ANSWERABLE:
+            lead = _lead(grid[tier].get(name, {})) or general      # an empty pool falls through to general
+            if lead == general:
+                cells.append({"tier": tier, "specialty": name, "model": lead,
+                              "listed": bool(_lead(grid[tier].get(name, {})))})
+    return cells
+
+
+def _warnings(configured: bool, dead: list, empty: list, shadowed: list, unknown: list, stray: list,
+              dead_cells: Any = None) -> list:
     """Plain sentences for the page. The dead-axis one is the point of this module: it
     names money spent on a question whose answer is thrown away."""
     out = []
@@ -181,6 +215,25 @@ def _warnings(configured: bool, dead: list, empty: list, shadowed: list, unknown
             "text": "Jev is asked what kind of work this is, but the %s tier%s no coding, writing or research "
                     "pool, so the answer is discarded on those turns." % (
                         _join(dead), " has" if len(dead) == 1 else "s have"),
+        })
+    # Level "cell", not "dead": a tier with a working coding pool is specialised, and a
+    # missing writing pool there is a choice rather than a fault. It is still named, because
+    # `jev doctor` names it and two views of one file must not disagree.
+    same = ["%s / %s" % (c["tier"], c["specialty"]) for c in (dead_cells or []) if c["listed"]]
+    missing = ["%s / %s" % (c["tier"], c["specialty"]) for c in (dead_cells or []) if not c["listed"]]
+    if same:
+        out.append({
+            "level": "cell",
+            "text": "%s lead%s with the same model general leads with in that tier, so Jev's answer about the "
+                    "kind of work cannot change the pick there. Put a different model first." % (
+                        _join(same), "s" if len(same) == 1 else ""),
+        })
+    if missing:
+        out.append({
+            "level": "cell",
+            "text": "%s %s no usable pool and fall%s through to general. Fine if that is the intent; "
+                    "`jev doctor` lists the same cells." % (
+                        _join(missing), "has" if len(missing) == 1 else "have", "s" if len(missing) == 1 else ""),
         })
     for tier in empty:
         higher = _higher(tier)

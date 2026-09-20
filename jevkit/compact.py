@@ -161,9 +161,16 @@ def handoff_prompt(digest_text: str, previous: str = "", *, confidential: bool =
     """The full prompt for whatever text model writes the capsule. Jev cannot write it."""
     prompt = HANDOFF_PROMPT + (CONFIDENTIAL_RULES if confidential else "")
     if previous.strip():
+        # Under confidentiality this sentence used to end "Do not lose identifiers" - appended
+        # AFTER the rules that forbid carrying them, so the last instruction the writer read
+        # contradicted the contract. A previous capsule is also the likeliest place for an
+        # old identifier to be hiding, which makes it the worst place to say that.
+        keep = ("Do not lose identifiers." if not confidential else
+                "The confidentiality rules above still apply: if the previous handoff carries an identifier "
+                "they forbid, do NOT carry it forward.")
         prompt += ("\nA PREVIOUS handoff for this same work is below. Carry forward anything still "
-                   "true, especially Pointers, and fold in what has happened since. Do not lose "
-                   "identifiers.\n\n<previous_handoff>\n" + previous.strip()[-6000:] + "\n</previous_handoff>\n")
+                   "true, especially Pointers, and fold in what has happened since. " + keep +
+                   "\n\n<previous_handoff>\n" + previous.strip()[-6000:] + "\n</previous_handoff>\n")
     return prompt + "\n\nTRANSCRIPT (already filtered; read the markers):\n\n" + digest_text + "\n"
 
 

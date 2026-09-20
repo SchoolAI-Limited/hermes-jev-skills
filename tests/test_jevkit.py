@@ -1182,7 +1182,7 @@ class TriageTests(unittest.TestCase):
 
     def test_a_stuck_customer_is_escalated_even_when_they_phrase_it_calmly(self):
         """The real case: "cannot do anything with these" scored mid-rubric and sat in today."""
-        out = triage.classify("Can't read incoming POs", "I can't do anything with these PDFs",
+        out = triage.classify("Cannot open any orders", "I cannot do anything with these files",
                               sender="s@customer.com", known_customer=True,
                               transport=jev_mail({2: 0.5, 3: 0.4, 4: 0.1}, kind="problem", blocked=0.6))
         self.assertEqual(out["route"], "now")

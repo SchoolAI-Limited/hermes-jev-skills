@@ -25,7 +25,7 @@ def write(path, blob):
         json.dump(blob, fh)
 
 
-class PoolGridTests(unittest.TestCase):
+class _Home(unittest.TestCase):
     """A user's own ~/.config/jev/routing.json must not leak into these results."""
 
     def setUp(self):
@@ -46,6 +46,8 @@ class PoolGridTests(unittest.TestCase):
         home = os.path.join(self.home, "profiles", profile) if profile else self.home
         return pools.grid_for(self.home, home)
 
+
+class PoolGridTests(_Home):
     def test_every_tier_and_specialty_has_a_cell_even_when_unconfigured(self):
         self.shared(GENERAL_ONLY)
         grid = self.grid()["tiers"]
@@ -182,6 +184,40 @@ class PoolGridTests(unittest.TestCase):
         self.assertEqual([p["name"] for p in out["profiles"]], ["default", "wiki"])
         self.assertEqual(out["tiers"], list(pools.TIERS))
         self.assertEqual(out["answerable"], list(pools.ANSWERABLE))
+
+
+class DeadCellTests(_Home):
+    """The page and `jev doctor` read the same file, so they must name the same cells."""
+
+    def test_a_specialty_pool_that_leads_with_generals_model_is_reported_dead(self):
+        self.shared({"tiers": {"medium": {"general": ["or:glm", "or:deepseek"],
+                                          "coding": ["or:glm", "or:kimi"],
+                                          "research": ["or:grok"]}}})
+        grid = self.grid()
+        self.assertEqual(grid["dead_tiers"], [])
+        dead = {(c["tier"], c["specialty"]) for c in grid["dead_cells"]}
+        self.assertEqual(dead, {("medium", "coding"), ("medium", "writing")})     # writing has no pool -> general
+        texts = [w["text"] for w in grid["warnings"] if w["level"] == "cell"]
+        self.assertTrue(any("medium / coding" in text and "same model" in text for text in texts))
+        self.assertTrue(any("medium / writing" in text and "falls through" in text for text in texts))
+
+    def test_the_page_agrees_with_jev_doctor_on_the_same_config(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+        from jevkit import route
+        config = {"tiers": {"simple": {"general": ["or:a"], "coding": ["or:a"], "writing": ["or:w"]},
+                            "hard": {"general": ["or:h"], "coding": ["or:free-model:free", "or:h"],
+                                     "research": ["or:r"]}}}
+        self.shared(config)
+        merged = dict(route.DEFAULT_CONFIG, **config)
+        doctor = {(c["tier"], c["specialty"]) for c in route.specialty_cells(merged) if c["dead"]}
+        page = {(c["tier"], c["specialty"]) for c in self.grid()["dead_cells"]}
+        self.assertEqual(page, doctor)
+
+    def test_a_tier_already_reported_dead_is_not_reported_again_cell_by_cell(self):
+        self.shared({"tiers": {"simple": {"general": ["or:a"]}}})
+        grid = self.grid()
+        self.assertEqual(grid["dead_tiers"], ["simple"])
+        self.assertEqual([c for c in grid["dead_cells"] if c["tier"] == "simple"], [])
 
 
 class ProvenanceTests(unittest.TestCase):

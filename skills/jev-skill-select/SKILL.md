@@ -10,23 +10,45 @@ metadata:
 
 # Skill selection with Jev
 
-Two requests, about 0.9 s for a few hundred skills. The first ranks every skill against the turn (side-by-side batches, each with a "none" option). The second reads the top five properly, judges each on its own, and may reject them all. Small talk and ordinary turns come back with no skill.
+Two requests, about 1.1 s. The first ranks every skill against the turn: the catalog is cut into batches of 120 that are asked side by side, each with a "none" option, so 460 skills and 960 skills take the same one round trip (both measured at 1.0 to 1.2 s for the pair). The second reads the top five properly, judges each on its own, and may reject them all. A turn that nothing in the catalog comes close to ends after the first request, about 0.7 s. Small talk and ordinary turns come back with no skill. Reading the skill folders is extra: about 0.15 s for 460 skills.
+
+Acknowledgements never leave the machine. "ok", "thanks, that worked", "got it", "never mind", "yes go ahead", a bare "stop" and turns that are only punctuation or emoji are answered locally in 0 ms. That gate is deliberately narrow. Anything with a question mark, an instruction however short ("do it", "stop it", "do all of them now"), a number, or a word the gate cannot read is sent to Jev, and that includes every request written in a non-Latin script. A wrong ask costs a fraction of a cent; a wrong skip makes the feature quietly do nothing.
 
 ## On Hermes
 
-`/jev skills on` makes the `hermes-jev` plugin do this once per fresh turn. When a skill clearly fits, a one-line suggestion is attached to the turn naming it; load it with `skill_view` unless it plainly does not apply. It reads the profile's skills folder and respects `skills.disabled`.
+`/jev skills on` makes the `hermes-jev` plugin do this once per fresh turn. When a skill clearly fits, a one-line suggestion is attached to the turn naming it; load it with `skill_view` unless it plainly does not apply. It reads the folders Hermes itself reads for the profile, which are the profile's skills folder and then every `skills.external_dirs` folder, and it respects `skills.disabled`. Project-local skill folders are not read.
 
 ## Asking directly (any agent)
 
 ```bash
 jev pick-skill --turn "<the request>"            # searches Hermes, Claude Code, Codex and ./skills folders
-jev pick-skill --turn "..." --root ~/my/skills   # or name the folders
+jev pick-skill --turn "..." --root ~/my/skills   # or name the folders; repeat --root for each one
 ```
 
-Reply: `needs_skill` (0–1) and up to three `{name, path, match}`. Load the first one whose `match` is 0.5 or more. An empty list means proceed without a skill; do not go hunting for one.
+`--root` replaces the default folders, so name every folder you want searched. From Python, `skillpick.discover_roots(hermes_home)` returns the folders Hermes reads, shared ones included, ready to pass to `skillpick.discover()`.
+
+## The reply
+
+```json
+{"status": "ok", "needs_skill": 0.78, "skills": [{"name": "xlsx", "path": ".../xlsx/SKILL.md", "match": 0.72}], "latency_ms": 1143}
+```
+
+`needs_skill` (0–1) and up to three `{name, path, match}`, best first. Load the first one whose `match` is 0.5 or more. An empty list means proceed without a skill; do not go hunting for one.
+
+Three other shapes, all with an empty `skills` list:
+
+| Reply | Meaning | What to do |
+|---|---|---|
+| `{"status": "ok", "needs_skill": 0.0, "skills": [], "latency_ms": 0, "skipped": "trivial"}` | Answered locally; Jev was not asked | Proceed without a skill |
+| `{"status": "ok", "needs_skill": 0.0, "skills": [], "latency_ms": 663}` | Jev ranked the catalog and nothing came close, so there was no second request | Proceed without a skill |
+| `{"status": "fail_open", "reason": "...", "skills": []}` | Jev was not asked or did not answer: outage, no skills found, or the turn looked like it held a secret | Proceed as if this skill did not exist. This is not a "no skill needed" verdict |
+
+`skills_dropped` appears on any of them when the catalog is over the 960-skill cap. It is how many skills, the last ones found, were never ranked, so "no skill fits" does not cover them. Their names are logged once per process. Disable skills you do not use to get back under the cap.
 
 ## Notes
 
-- It reads only each skill's `name` and `description` from its front matter, so a skill with a vague description will not be found. Fix the description, not the threshold.
-- The turn is redacted before sending; a turn that looks like it holds a secret is not sent, and you get an empty list.
+- It reads only each skill's `name` and `description` from its front matter, and only the first 200 characters of the description, so a skill with a vague or long-winded description will not be found. Fix the description, not the threshold.
+- When two folders hold a skill of the same name, the first folder searched wins. On Hermes that is the profile's own folder.
+- The turn is redacted before sending; a turn that looks like it holds a secret is not sent, and you get `fail_open` with an empty list.
+- If any one batch fails, the whole pick fails open. A partial ranking would say "no skill" with confidence whenever the right skill sat in the batch that was lost.
 - A suggestion is advice. If the loaded skill does not match the task once you read it, drop it and carry on.

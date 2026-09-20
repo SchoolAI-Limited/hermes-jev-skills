@@ -96,7 +96,12 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
             layer = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        tiers = {**config.get("tiers", {}), **(layer.get("tiers") or {})}   # a profile may override one tier only
+        # Valid JSON is not always a valid config. A file holding a list, or a `tiers` that
+        # is a list of names, raised here, and this runs at plugin load and on every turn.
+        if not isinstance(layer, dict):
+            continue
+        own = layer.get("tiers") if isinstance(layer.get("tiers"), dict) else {}
+        tiers = {**config.get("tiers", {}), **own}   # a profile may override one tier only
         config.update(layer)
         config["tiers"] = tiers
     return config
@@ -109,7 +114,20 @@ def _ref(row: Dict[str, Any]) -> str:
 
 
 def _excluded(ref: str, patterns: List[str]) -> bool:
-    return any(fnmatch.fnmatch(ref, pattern) or fnmatch.fnmatch(ref.split(":", 1)[1], pattern) for pattern in patterns)
+    return any(fnmatch.fnmatch(ref, pattern) or fnmatch.fnmatch(ref.split(":", 1)[-1], pattern) for pattern in patterns)
+
+
+def _usable(ref: Any, exclude: List[str], only_provider: Optional[str]) -> bool:
+    """Can the router ever return this pool entry. Shared with the health checks so they cannot drift from `_pick`."""
+    # A hand-edited pool entry with no "provider:" prefix raised IndexError here and then
+    # ValueError where the pick is split, on every turn. A typo in routing.json must cost
+    # that one entry, not the turn; `pool_problems` is where it gets said out loud.
+    if not isinstance(ref, str) or ":" not in ref:
+        return False
+    if _excluded(ref, exclude):
+        return False
+    # A plugin can swap the model, not the provider it is already connected to.
+    return not only_provider or ref.split(":", 1)[0] == only_provider
 
 
 # A model that names its own specialty is telling you something the price band cannot.
@@ -149,34 +167,181 @@ def suggest_tiers(rows: List[Dict[str, Any]], exclude: List[str], per_pool: int 
     return out
 
 
-def dead_axis(config: Dict[str, Any]) -> List[str]:
-    """Tiers where Jev is asked for a specialty that cannot change the answer.
+# The specialties Jev's `kind` answer can actually select. `vision` is not one: images are
+# detected locally and are a hard requirement, not something Jev is asked about.
+_ANSWERABLE = tuple(kind for kind in KIND if kind != "general")
 
-    `route` pays for a Choice over SPECIALTIES on every turn. If a tier only has `general`
-    and `vision` pools then every specialty answer resolves to the same model, and that
+
+def dead_axis(config: Dict[str, Any]) -> List[str]:
+    """Tiers with no specialist pool at all. The coarse view; `specialty_cells` is the honest one.
+
+    `route` pays for a Choice over KIND on every turn. If a tier only has `general` and
+    `vision` pools then every specialty answer resolves to the same model, and that
     request is pure cost. Worth saying out loud rather than leaving someone to notice that
     a routing decision never varies.
+
+    This only asks whether a pool KEY exists. It reported a live config as healthy while
+    five of its nine specialist pools led with the same model as their tier's general
+    pool, so it is kept for callers that want the tier list and is no longer the check to
+    rely on. A pool that exists and resolves to the general model is just as dead.
     """
-    specialist = [s for s in SPECIALTIES if s not in ("general", "vision")]
     blind: List[str] = []
     for tier, pools in (config.get("tiers") or {}).items():
-        if isinstance(pools, dict) and not any(pools.get(s) for s in specialist):
+        if isinstance(pools, dict) and not any(pools.get(s) for s in _ANSWERABLE):
             blind.append(tier)
     return blind
+
+
+def specialty_cells(config: Dict[str, Any], only_provider: Optional[str] = None) -> List[Dict[str, Any]]:
+    """One row per (tier, specialty): the model it resolves to, and whether the answer can matter.
+
+    A cell is dead when the first model the router could return for that specialty is the
+    same one it returns for `general` in that tier. Jev's kind answer is still bought on
+    those turns and cannot change the pick. Both sides are resolved by `_pick` itself, so
+    excludes, the provider constraint and the fall-through to `general` are judged exactly
+    as a real turn would be, and this cannot drift from the router.
+
+    Judged on a turn with no images and a small context. Two pools that share a lead can
+    still differ further down, which only shows when the lead cannot hold the turn's
+    context. That is rare enough that sharing a lead is reported as dead.
+    """
+    tiers = config.get("tiers") or {}
+    exclude = config.get("exclude") or []
+    cells: List[Dict[str, Any]] = []
+    for tier in TIERS:
+        pools = tiers.get(tier)
+        if not isinstance(pools, dict):
+            continue
+        general = _pick(config, {}, tier, "general", False, 0, only_provider)
+        for specialty in _ANSWERABLE:
+            lead = _pick(config, {}, tier, specialty, False, 0, only_provider)
+            cell: Dict[str, Any] = {"tier": tier, "specialty": specialty, "model": lead,
+                                    "general": general, "dead": lead == general}
+            if cell["dead"]:
+                listed = pools.get(specialty) if isinstance(pools.get(specialty), list) else []
+                if not listed:
+                    cell["why"] = "no pool, so it falls through to general"
+                elif not any(_usable(ref, exclude, only_provider) for ref in listed):
+                    cell["why"] = "every model in the pool is excluded or unusable, so it falls through to general"
+                else:
+                    cell["why"] = "leads with the same model as general"
+            cells.append(cell)
+    return cells
+
+
+def pool_problems(config: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Pool entries the router silently skips because they are not `provider:model`.
+
+    Skipping is the right thing to do on a live turn and the wrong thing to keep quiet
+    about: the person who typed the entry believes that model is in use.
+    """
+    found: List[Dict[str, str]] = []
+    for tier, pools in (config.get("tiers") or {}).items():
+        if not isinstance(pools, dict):
+            found.append({"tier": str(tier), "problem": "not a {pool: [models]} mapping"})
+            continue
+        for name, listed in pools.items():
+            if not isinstance(listed, list):
+                found.append({"tier": str(tier), "pool": str(name), "problem": "not a list of models"})
+                continue
+            for ref in listed:
+                if not isinstance(ref, str) or ":" not in ref:
+                    found.append({"tier": str(tier), "pool": str(name), "entry": str(ref)[:120],
+                                  "problem": "not provider:model, so it is never picked"})
+    return found
+
+
+def _by_ref(rows: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Catalog rows keyed the way pools name them, or None when the catalog cannot be had.
+
+    None is not an empty catalog. Empty means it loaded and lists nothing callable, and
+    every pin is trusted as before. None means nothing about any model can be checked.
+    """
+    if rows is None:
+        try:
+            rows = catalog_mod.models()
+        except Exception:  # noqa: BLE001 - no cache and no network is a normal state for a laptop
+            return None
+    return {_ref(row): row for row in rows}
+
+
+def price_ladder(config: Dict[str, Any], rows: Optional[List[Dict[str, Any]]] = None,
+                 only_provider: Optional[str] = None) -> Dict[str, Any]:
+    """Does routing DOWN a tier actually cost less. Nothing else checks that it does.
+
+    Pools are typed by hand, and the tier names promise a price order the file does not
+    enforce. A live config led `simple` with a $0.24 model and `medium` with a $0.132 one,
+    so every turn Jev judged easy went to a model 1.8x dearer than a harder turn would get.
+
+    Each specialty column is resolved per tier the way a real turn would be, then every
+    lower/higher pair is compared on the catalog's blended price. Three outcomes, never a
+    guess:
+
+    * ``inversions``: the lower tier's lead costs more than the higher tier's.
+    * ``delegated``: the same shape, but the higher tier is `hard` and an escalation
+      ladder is on. That is allowed. The hard tier's model is then the driver, and the
+      frontier work is handed up the ladder, so a cheap lead there is the design.
+    * ``unknown``: a lead has no catalog price. A pin the catalog has never heard of is
+      legal, so this is not an error, but it is not a pass either.
+    """
+    by_ref = _by_ref(rows) or {}          # no catalog: every lead is unpriced, and is reported as such
+    tiers = config.get("tiers") or {}
+    configured = [tier for tier in TIERS if isinstance(tiers.get(tier), dict)]
+    settings = config.get("escalation") or {}
+    delegating = bool(settings.get("enabled") and settings.get("rungs"))
+
+    grouped: "OrderedDict[tuple, Dict[str, Any]]" = OrderedDict()
+    unpriced: "OrderedDict[str, List[str]]" = OrderedDict()
+    compared = 0
+    for specialty in ("general",) + _ANSWERABLE + ("vision",):
+        vision = specialty == "vision"
+        leads = [(tier, _pick(config, by_ref, tier, "general" if vision else specialty, vision, 0, only_provider))
+                 for tier in configured]
+        for low in range(len(leads)):
+            for high in range(low + 1, len(leads)):
+                (low_tier, low_model), (high_tier, high_model) = leads[low], leads[high]
+                if not low_model or not high_model or low_model == high_model:
+                    continue
+                prices = [(by_ref.get(model) or {}).get("price") for model in (low_model, high_model)]
+                if None in prices:
+                    for tier, model, price in ((low_tier, low_model, prices[0]), (high_tier, high_model, prices[1])):
+                        if price is None and f"{tier}/{specialty}" not in unpriced.setdefault(model, []):
+                            unpriced[model].append(f"{tier}/{specialty}")
+                    continue
+                compared += 1
+                if prices[0] <= prices[1]:
+                    continue
+                entry = grouped.setdefault((low_tier, low_model, high_tier, high_model), {
+                    "lower": {"tier": low_tier, "model": low_model, "price": prices[0]},
+                    "higher": {"tier": high_tier, "model": high_model, "price": prices[1]},
+                    "ratio": round(prices[0] / prices[1], 2) if prices[1] else None,
+                    "specialties": [], "delegated": high_tier == "hard" and delegating})
+                entry["specialties"].append(specialty)
+
+    split: Dict[bool, List[Dict[str, Any]]] = {True: [], False: []}
+    for entry in grouped.values():
+        split[entry.pop("delegated")].append(entry)
+    unknown = [{"model": model, "leads": cells} for model, cells in unpriced.items()]
+    return {
+        "status": "inverted" if split[False] else "unknown" if unknown else "ok",
+        "compared": compared, "inversions": split[False], "delegated": split[True], "unknown": unknown,
+    }
 
 
 def _pick(config: Dict[str, Any], rows: Dict[str, Dict[str, Any]], tier: str, specialty: str,
           need_vision: bool, context_tokens: int, only_provider: Optional[str] = None) -> Optional[str]:
     tiers = config.get("tiers") or {}
+    exclude = config.get("exclude") or []
     order = [tier] + [t for t in TIERS[TIERS.index(tier):] if t != tier]  # never fall DOWN a tier
     for candidate_tier in order:
-        pools = tiers.get(candidate_tier) or {}
+        pools = tiers.get(candidate_tier)
+        if not isinstance(pools, dict):
+            continue
         for name in (("vision",) if need_vision else ()) + (specialty, "general"):
-            for ref in pools.get(name) or []:
-                if _excluded(ref, config.get("exclude") or []):
+            listed = pools.get(name)
+            for ref in listed if isinstance(listed, list) else []:
+                if not _usable(ref, exclude, only_provider):
                     continue
-                if only_provider and ref.split(":", 1)[0] != only_provider:
-                    continue          # a plugin can swap the model, not the provider it is already connected to
                 row = rows.get(ref)
                 if row is None:          # pinned by the user but unknown to the catalog: trust the pin
                     if not need_vision:
@@ -267,6 +432,26 @@ def _remember(key: Optional[str], decision: Dict[str, Any], config: Dict[str, An
     return decision
 
 
+def _with_escalation(decision: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the ladder's answer at read time. It is never stored in the decision cache.
+
+    A seat that was free when a recurring job was first judged can be full an hour later.
+    The cached decision used to carry the rung it was given the first time, so the notice
+    and the audit log kept naming a seat every other lane already knew had refused.
+    """
+    settings = config.get("escalation") or {}
+    if decision.get("tier") != "hard" or not (settings.get("enabled") and settings.get("rungs")):
+        return decision
+    # A frontier seat is worth its cost only on work that earned the hard tier. Everything
+    # below hard stays on OpenRouter, which is the whole point of paying for frontier seats.
+    escalation = ladder.choose(settings["rungs"])
+    escalation["stakes"] = decision.get("costly_mistake")
+    notice = decision.get("notice") or ""
+    if escalation.get("rung"):
+        notice += f" · escalate to {escalation['rung']}" + (" (forced)" if escalation.get("forced") else "")
+    return {**decision, "escalate": escalation, "notice": notice}
+
+
 def _keep(current: Optional[str], reason: str, **extra: Any) -> Dict[str, Any]:
     out = {"routed": False, "model": current, "reason": reason, "policy": POLICY_VERSION,
            "notice": f"[Jev] kept {current or 'current model'} · {reason}"}
@@ -303,7 +488,7 @@ def decide(
         cache_key = _cache_key(ask, profile, only_provider, has_images, bool(pinned))
         cached = _DECISIONS.get(cache_key)
         if cached is not None:
-            return {**cached, "cached": True}
+            return _with_escalation({**cached, "cached": True}, config)
     risky = bool(_HARD_RISK.search(privacy.normalize(ask)))
     private = profile in (config.get("private_profiles") or []) or privacy.is_sensitive(ask)
     mode = "features" if private else config.get("mode", "redacted-text")
@@ -351,8 +536,12 @@ def decide(
     kind = answers["kind"]
     specialty = kind["choice"] if kind["confidence"] >= 0.5 else "general"
 
-    catalog_rows = rows if rows is not None else catalog_mod.models()
-    by_ref = {_ref(row): row for row in catalog_rows}
+    # With no cache and no network the catalog load raises, and it used to take the turn
+    # with it. Routing blind is not the answer either: without rows nothing checks that the
+    # context fits, so a long conversation could be sent to a model that cannot hold it.
+    by_ref = _by_ref(rows)
+    if by_ref is None:
+        return _keep(current, "model catalog unavailable", private=private)
     picked = _pick(config, by_ref, tier, specialty, has_images, context_tokens, only_provider)
     if not picked:
         return _keep(current, f"no {tier} model fits this turn", private=private)
@@ -364,17 +553,8 @@ def decide(
             return _keep(current, "large context; switching down would cost more than it saves", private=private)
 
     provider, model = picked.split(":", 1)
-    escalation = None
-    settings = config.get("escalation") or {}
-    if tier == "hard" and settings.get("enabled") and settings.get("rungs"):
-        # A frontier seat is worth its cost only on work that earned the hard tier. Everything
-        # below hard stays on OpenRouter, which is the whole point of paying for frontier seats.
-        escalation = ladder.choose(settings["rungs"])
-        escalation["stakes"] = round(stakes, 3)
-
-    return _remember(cache_key, {
+    return _with_escalation(_remember(cache_key, {
         "routed": picked != current, "model": picked, "provider": provider, "model_id": model, "tier": tier,
-        **({"escalate": escalation} if escalation else {}),
         # Carried out so a reader can tell WHICH pool the model came from. Without it a
         # model listed in both `vision` and `general` is unattributable after the fact,
         # and "did the specialty answer earn its keep?" becomes unanswerable.
@@ -382,7 +562,5 @@ def decide(
         "confidence": round(confidence, 3), "difficulty": round(difficulty, 2),
         "costly_mistake": round(stakes, 3), "private": private, "mode": mode, "latency_ms": reply["latency_ms"],
         "policy": POLICY_VERSION, "reason": f"{tier} {specialty}", "unwrapped": unwrapped,
-        "notice": (f"[Jev] {tier} · {specialty} → {model} · confidence {confidence:.2f}"
-                   + (f" · escalate to {escalation['rung']}" + (" (forced)" if escalation.get("forced") else "")
-                      if escalation and escalation.get("rung") else "")),
-    }, config)
+        "notice": f"[Jev] {tier} · {specialty} → {model} · confidence {confidence:.2f}",
+    }, config), config)

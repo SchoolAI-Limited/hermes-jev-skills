@@ -842,5 +842,17 @@ class NightlyDryRunTests(unittest.TestCase):
         self.assertFalse(report["dry_run"])
 
 
+class ConfidentialPreviousCapsuleTests(unittest.TestCase):
+    def test_a_previous_capsule_never_reinstates_keep_identifiers_under_confidentiality(self):
+        """The last sentence the writer read said "Do not lose identifiers" - after the rules
+        forbidding them. A previous capsule is where an old identifier is most likely hiding."""
+        from jevkit import compact
+        prompt = compact.handoff_prompt("[KEEP VERBATIM] user: x", previous="## Pointers\nold", confidential=True)
+        self.assertNotIn("Do not lose identifiers", prompt)
+        self.assertIn("do NOT carry it forward", prompt)
+        self.assertIn("Do not lose identifiers",
+                      compact.handoff_prompt("[KEEP VERBATIM] user: x", previous="## Pointers\nold"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -230,3 +230,496 @@ class MemoryTests(unittest.TestCase):
         storage = next(c for c in table if "Storage" in c["description"])
         self.assertIn("currently selected", general["description"])
         self.assertNotIn("currently selected", storage["description"])
+
+
+# ---------------------------------------------------------------- --plan
+#
+# Everything below runs against a fake driver, a fake `open` and a fake Jev. No window is
+# touched, no process is launched except where the test is about launching one, and no
+# secret store is read: the keys main() looks for are put in the environment first.
+
+import contextlib
+import io
+import json
+import os
+import shutil
+from unittest import mock
+
+FAKE_KEYS = {"TYPESAFE_API_KEY": "t" * 40, "OPENROUTER_API_KEY": "o" * 40}
+
+WINDOWS = [
+    # The driver's own cursor overlay: always on top, never the window anyone means.
+    {"window_id": 1, "pid": 10, "app_name": "Cua Driver", "title": "", "z_index": 99,
+     "is_on_screen": True, "on_current_space": True},
+    {"window_id": 22, "pid": 20, "app_name": "Safari", "title": "Start Page", "z_index": 8,
+     "is_on_screen": True, "on_current_space": True},
+    {"window_id": 33, "pid": 30, "app_name": "System Settings", "title": "General", "z_index": 5,
+     "is_on_screen": True, "on_current_space": True},
+]
+
+STATE = {"window_title": "General", "elements": [
+    {"element_index": 1, "role": "AXButton", "label": "Storage", "element_token": "tok-storage",
+     "frame": {"x": 10, "y": 10, "w": 90, "h": 24}},
+    {"element_index": 2, "role": "AXSearchField", "label": "Search", "element_token": "tok-search",
+     "frame": {"x": 10, "y": 50, "w": 200, "h": 24}},
+]}
+
+
+APPS = [{"name": "Safari", "bundle_id": "com.apple.Safari", "pid": 20, "running": True},
+        {"name": "System Settings", "bundle_id": "com.apple.systempreferences", "pid": 30, "running": True},
+        {"name": "Numbers", "bundle_id": "com.apple.iWork.Numbers", "pid": 0, "running": False}]
+
+
+class FakeDriver:
+    def __init__(self, failing=None, state=None, windows=None, windows_after=None):
+        self.calls = []
+        self.failing = failing or {}
+        self.state = STATE if state is None else state
+        self.windows = WINDOWS if windows is None else windows
+        self.windows_after = windows_after      # what list_windows says from the second call on
+
+    def tool(self, name, args, timeout=90.0):
+        self.calls.append((name, dict(args)))
+        if name in self.failing:
+            return {"result": {"isError": True, "content": [{"type": "text", "text": self.failing[name]}]}}
+        if name == "list_windows":
+            later = self.windows_after is not None and len(self.named("list_windows")) > 1
+            return {"result": {"structuredContent": {"windows": self.windows_after if later else self.windows}}}
+        if name == "list_apps":
+            return {"result": {"structuredContent": {"apps": APPS}}}
+        if name == "get_window_state":
+            return {"result": {"structuredContent": self.state}}
+        return {"result": {"structuredContent": {"effect": "confirmed"}}}
+
+    def named(self, name):
+        return [args for called, args in self.calls if called == name]
+
+    def stop(self):
+        self.calls.append(("stop", {}))
+
+
+class FakeOpen:
+    def __init__(self, returncode=0):
+        self.commands = []
+        self.returncode = returncode
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(list(command))
+        return mock.Mock(returncode=self.returncode, stderr="Unable to find application" if self.returncode else "")
+
+
+def pick(prefix):
+    """A Jev that always chooses the first offered action of one kind."""
+    seen = []
+
+    def choose(request):
+        seen.append(request)
+        chosen = next(c["id"] for c in request["candidates"] if c["id"].startswith(prefix))
+        return {"selected_id": chosen, "confidence": 0.93, "reason": "chosen"}
+
+    choose.seen = seen
+    return choose
+
+
+def planner(steps, status="planned", reason=""):
+    def plan(command, **context):
+        plan.context = dict(context, command=command)
+        return {"status": status, "reason": reason, "steps": steps, "dropped": [],
+                "latency_ms": 812, "model": "test/model"}
+    return plan
+
+
+def plan_args(goal, **over):
+    import argparse
+    return argparse.Namespace(**dict({"goal": goal, "session": "", "expect": "", "max_steps": 10}, **over))
+
+
+def run_plan(goal, steps, driver=None, chooser=None, opener=None, **over):
+    driver = driver or FakeDriver()
+    opener = opener or FakeOpen()
+    where = {"pid": over.pop("pid", None), "window_id": over.pop("window_id", None)}
+    with mock.patch.object(gui, "jev_choose", chooser or pick("click:")), \
+            mock.patch.object(gui.sys, "platform", "darwin"), \
+            mock.patch.object(gui, "default_browser", lambda: "com.apple.safari"), \
+            contextlib.redirect_stdout(io.StringIO()):
+        out = gui.run_plan(driver, where, plan_args(goal, **over), [], gui.MAX_REGIONS,
+                           planner=steps if callable(steps) else planner(steps),
+                           opener=opener, sleep=lambda s: None)
+    return out, driver, opener, where
+
+
+@unittest.skipIf(gui.jev_plan is None, "jevkit.plan is not importable here")
+class DirectOperationTests(unittest.TestCase):
+    """The direct ops are where a string a model wrote is handed to the operating system."""
+
+    def direct(self, step, driver=None, where=None, browser="com.apple.safari"):
+        driver, opener = driver or FakeDriver(), FakeOpen()
+        where = {"pid": None, "window_id": None} if where is None else where
+        with mock.patch.object(gui.sys, "platform", "darwin"):
+            ok, detail = gui.run_direct(driver, where, "", step, opener=opener, sleep=lambda s: None,
+                                        browser=browser)
+        return ok, detail, opener, driver, where
+
+    def test_an_address_that_is_not_http_or_https_never_reaches_open(self):
+        """`open` launches whatever a scheme is registered to: file: opens local files,
+        tel: dials, and any installed app can claim its own."""
+        for hostile in ("file:///etc/hosts", "javascript:alert(1)", "tel:+15555550100",
+                        "x-apple.systempreferences:com.apple.preference.security",
+                        "https://example.com -a Terminal", "https://apple.com@evil.example/"):
+            with self.subTest(target=hostile):
+                ok, detail, opener, _, _ = self.direct({"kind": "open_url", "target": hostile})
+                self.assertFalse(ok)
+                self.assertIn("refused", detail)
+                self.assertEqual(opener.commands, [])
+
+    def test_a_web_address_is_opened_as_the_only_argument(self):
+        ok, _, opener, _, _ = self.direct({"kind": "open_url", "target": "https://example.com/a?b=c"})
+        self.assertTrue(ok)
+        self.assertEqual(opener.commands, [[gui.OPEN, "https://example.com/a?b=c"]])
+
+    def test_the_next_step_is_aimed_at_the_browser_not_at_whatever_is_in_front(self):
+        """Recorded live. `open` loaded the page in a browser window BEHIND System Settings,
+        because a background process is not always allowed to take focus. "The front window
+        afterwards" was System Settings, and the following click would have landed there."""
+        behind = [dict(w, z_index={"Safari": 3, "System Settings": 9}.get(w["app_name"], w["z_index"]))
+                  for w in WINDOWS]
+        _, _, _, _, where = self.direct({"kind": "open_url", "target": "https://example.com"},
+                                        driver=FakeDriver(windows=behind))
+        self.assertEqual(where, {"pid": 20, "window_id": 22})
+
+    def test_with_no_known_browser_only_a_window_that_changed_is_accepted(self):
+        loaded = [dict(w, title="Example Domain") if w["app_name"] == "Safari" else w for w in WINDOWS]
+        _, _, _, _, where = self.direct({"kind": "open_url", "target": "https://example.com"},
+                                        driver=FakeDriver(windows_after=loaded), browser="")
+        self.assertEqual(where, {"pid": 20, "window_id": 22})
+        ok, detail, _, _, where = self.direct({"kind": "open_url", "target": "https://example.com"}, browser="")
+        self.assertFalse(ok)                      # nothing moved: no evidence of where it opened
+        self.assertEqual(where, {"pid": None, "window_id": None})
+
+    def test_an_app_is_opened_by_name_never_by_path_or_flag(self):
+        for hostile in ("/tmp/Evil.app", "../Evil", "-n", "--args"):
+            with self.subTest(target=hostile):
+                ok, _, opener, _, _ = self.direct({"kind": "open_app", "target": hostile})
+                self.assertFalse(ok)
+                self.assertEqual(opener.commands, [])
+
+    def test_opening_an_app_aims_the_next_step_at_that_apps_window(self):
+        """Without this a command that opens an app has nowhere to click afterwards: the
+        pid and window id cannot be known before the app exists."""
+        ok, _, opener, _, where = self.direct({"kind": "open_app", "target": "System Settings"})
+        self.assertTrue(ok)
+        self.assertEqual(opener.commands, [[gui.OPEN, "-a", "System Settings"]])
+        self.assertEqual(where, {"pid": 30, "window_id": 33})
+
+    def test_an_app_that_never_shows_a_window_fails_the_step(self):
+        """Falling back to "whatever is in front" would aim the following clicks at an
+        unrelated app."""
+        ok, detail, _, _, where = self.direct({"kind": "open_app", "target": "Numbers"})
+        self.assertFalse(ok)
+        self.assertIn("no window", detail)
+        self.assertEqual(where, {"pid": None, "window_id": None})
+
+    def test_open_failing_is_reported_not_assumed_to_have_worked(self):
+        driver, opener = FakeDriver(), FakeOpen(returncode=1)
+        with mock.patch.object(gui.sys, "platform", "darwin"):
+            ok, detail = gui.run_direct(driver, {"pid": None, "window_id": None}, "",
+                                        {"kind": "open_app", "target": "Nonesuch"}, opener=opener)
+        self.assertFalse(ok)
+        self.assertIn("open failed", detail)
+
+    def test_keys_and_menus_use_the_drivers_real_tool_names_and_arguments(self):
+        """Taken from the driver's own tools/list: `press_key` takes `key`, a chord is
+        `hotkey` with `keys`, and a menu is `invoke_menu` with `path`. A guessed name is
+        refused by the driver as an unclassified tool."""
+        where = {"pid": 30, "window_id": 33}
+        _, _, _, driver, _ = self.direct({"kind": "press_key", "target": "return"}, where=dict(where))
+        self.assertEqual(driver.named("press_key"),
+                         [{"pid": 30, "window_id": 33, "key": "return", "delivery_mode": "foreground"}])
+        _, _, _, driver, _ = self.direct({"kind": "press_key", "target": "cmd+shift+t"}, where=dict(where))
+        self.assertEqual(driver.named("hotkey"), [{"pid": 30, "window_id": 33, "keys": ["cmd", "shift", "t"],
+                                                   "delivery_mode": "foreground"}])
+        _, _, _, driver, _ = self.direct({"kind": "menu", "target": "File > New Window"}, where=dict(where))
+        self.assertEqual(driver.named("invoke_menu"), [{"pid": 30, "window_id": 33, "path": ["File", "New Window"]}])
+
+    def test_a_key_that_is_not_on_the_list_is_never_sent(self):
+        ok, _, _, driver, _ = self.direct({"kind": "press_key", "target": "power"}, where={"pid": 30, "window_id": 33})
+        self.assertFalse(ok)
+        self.assertEqual(driver.named("press_key") + driver.named("hotkey"), [])
+
+    def test_a_refusal_in_the_result_body_is_a_failure(self):
+        """The driver fails closed by answering isError inside a normal result. Reading
+        only the JSON-RPC error field called a refused menu path a success."""
+        driver = FakeDriver(failing={"invoke_menu": "invoke_menu: menu path unavailable"})
+        ok, detail, _, _, _ = self.direct({"kind": "menu", "target": "File > Nope"}, driver=driver,
+                                          where={"pid": 30, "window_id": 33})
+        self.assertFalse(ok)
+        self.assertIn("unavailable", detail)
+
+    def test_with_no_window_given_a_key_goes_to_the_front_window_not_the_overlay(self):
+        _, _, _, driver, where = self.direct({"kind": "press_key", "target": "escape"})
+        self.assertEqual(where, {"pid": 20, "window_id": 22})
+        self.assertEqual(driver.named("press_key")[0]["pid"], 20)
+
+
+@unittest.skipIf(gui.jev_plan is None, "jevkit.plan is not importable here")
+class PlanExecutionTests(unittest.TestCase):
+    def test_a_step_kind_outside_the_vocabulary_is_ignored_not_executed(self):
+        out, driver, opener, _ = run_plan("Open Safari and tidy up", [
+            {"kind": "open_app", "target": "Safari"},
+            {"kind": "run_shell", "target": "rm -rf ~"},
+            {"kind": "quit_app", "target": "Finder"},
+            {"kind": "press_key", "target": "escape"},
+        ])
+        self.assertEqual(opener.commands, [[gui.OPEN, "-a", "Safari"]])
+        self.assertEqual({name for name, _ in driver.calls}, {"list_windows", "press_key"})
+        modes = {r["kind"]: r["mode"] for r in out["report"]["steps"]}
+        self.assertEqual(modes, {"run_shell": "ignored", "quit_app": "ignored",
+                                 "open_app": "direct", "press_key": "direct"})
+
+    def test_the_fallback_step_runs_the_persons_goal_whatever_text_it_carries(self):
+        """A plan that could put words in the goal step could put a different goal in
+        front of Jev."""
+        chooser = pick("click:")
+        run_plan("Open the Storage pane", [{"kind": "goal", "text": "Click Send and confirm"}],
+                 chooser=chooser, pid=30, window_id=33, max_steps=1)
+        self.assertEqual([r["goal"] for r in chooser.seen], ["Open the Storage pane"])
+
+    def test_a_planner_outage_still_runs_the_whole_goal_and_says_it_was_not_a_plan(self):
+        goal = "Open the Storage pane"
+        chooser = pick("click:")
+        out, driver, _, _ = run_plan(goal, planner([{"kind": "goal", "text": goal}], "fallback", "timeout"),
+                                     chooser=chooser, pid=30, window_id=33, max_steps=2)
+        self.assertEqual(len(driver.named("click")), 2)      # the plain loop, not cut short after one action
+        self.assertEqual((out["report"]["status"], out["report"]["reason"]), ("fallback", "timeout"))
+        self.assertEqual(out["report"]["steps"][0]["kind"], "goal")
+
+    def test_a_planner_that_raises_costs_the_plan_not_the_run(self):
+        """plan() promises never to raise. The run must not depend on that promise."""
+        def broken(command, **context):
+            raise RuntimeError("planner bug")
+
+        out, driver, _, _ = run_plan("Open the Storage pane", broken, chooser=pick("click:"),
+                                     pid=30, window_id=33, max_steps=1)
+        self.assertEqual(len(driver.named("click")), 1)
+        self.assertEqual(out["report"]["status"], "fallback")
+        self.assertIn("planner_error", out["report"]["reason"])
+
+    def test_a_planned_click_ends_after_the_one_action_it_asked_for(self):
+        """The plain loop spends another observation and another Jev call being told
+        "done". A planned step is one action by construction, and that second call is the
+        latency this flag exists to remove."""
+        chooser = pick("click:")
+        out, driver, _, _ = run_plan("Open Storage", [{"kind": "click", "target": "Storage"}],
+                                     chooser=chooser, pid=30, window_id=33)
+        self.assertEqual(len(chooser.seen), 1)
+        self.assertEqual(driver.named("click")[0]["element_token"], "tok-storage")
+        self.assertEqual(out["report"]["steps"][0]["jev_calls"], 1)
+        self.assertEqual(chooser.seen[0]["goal"], "Click Storage.")
+
+    def test_dictated_text_is_typed_as_given_into_the_field_jev_picked(self):
+        """No second model call to "choose a value", and no typing at wherever the focus
+        happens to be: with no field focused a web app reads letters as shortcuts."""
+        with mock.patch.object(gui, "text_helper", side_effect=AssertionError("text model called")):
+            _, driver, _, _ = run_plan('Type "solar eclipse" into search',
+                                       [{"kind": "type_text", "target": "search field", "text": "solar eclipse"}],
+                                       chooser=pick("type:"), pid=30, window_id=33)
+        typed = driver.named("type_text")
+        self.assertEqual(len(typed), 1)
+        self.assertEqual((typed[0]["text"], typed[0]["element_token"]), ("solar eclipse", "tok-search"))
+
+    def test_the_dictated_text_is_not_sent_to_jev(self):
+        chooser = pick("type:")
+        run_plan('Type "the launch is on the ninth" into search',
+                 [{"kind": "type_text", "target": "search field", "text": "the launch is on the ninth"}],
+                 chooser=chooser, pid=30, window_id=33)
+        self.assertNotIn("ninth", json.dumps(chooser.seen))
+
+    def test_a_failed_step_ends_the_plan_before_anything_is_typed(self):
+        """The later steps assumed this one happened. Typing into a window that did not
+        open is how text ends up somewhere it was never meant to go."""
+        driver = FakeDriver(failing={"invoke_menu": "menu path unavailable"})
+        out, driver, _, _ = run_plan('Make a new note and type "hello"', [
+            {"kind": "menu", "target": "File > New Note"},
+            {"kind": "type_text", "target": "note", "text": "hello"},
+        ], driver=driver, chooser=pick("type:"), pid=30, window_id=33)
+        self.assertEqual(driver.named("type_text"), [])
+        self.assertEqual([(r["mode"], r["ok"]) for r in out["report"]["steps"]],
+                         [("direct", False), ("not_run", False)])
+
+    def test_max_steps_bounds_the_whole_plan_not_each_step(self):
+        chooser = pick("click:")
+        out, _, _, _ = run_plan("Open General then Storage", [
+            {"kind": "click", "target": "General"}, {"kind": "click", "target": "Storage"},
+        ], chooser=chooser, pid=30, window_id=33, max_steps=1)
+        self.assertEqual(len(chooser.seen), 1)
+        self.assertEqual(out["used"], 1)
+        self.assertIn("budget", out["report"]["steps"][1]["detail"])
+
+    def test_the_runner_enforces_never_send_itself_whoever_wrote_the_plan(self):
+        out, driver, _, _ = run_plan("Open Mail and have a look", [
+            {"kind": "open_app", "target": "Safari"}, {"kind": "click", "target": "Send"},
+            {"kind": "click", "target": "Confirm"}], chooser=pick("click:"))
+        self.assertEqual(driver.named("click"), [])
+        self.assertEqual([d["target"] for d in out["report"]["dropped"]], ["Send", "Confirm"])
+
+    def test_the_planner_is_told_what_is_in_front_without_naming_the_overlay(self):
+        fake = planner([{"kind": "wait", "amount": 1}])
+        run_plan("Wait a second", fake)
+        self.assertEqual(fake.context["front_app"], "Safari")
+        self.assertEqual(fake.context["running_apps"], ["Safari", "System Settings"])
+
+    def test_jev_abstaining_on_a_step_is_carried_out_to_the_exit_code(self):
+        out, _, _, _ = run_plan("Open Storage", [{"kind": "click", "target": "Storage"}],
+                                chooser=pick("abstain"), pid=30, window_id=33)
+        self.assertTrue(out["abstained"])
+        self.assertFalse(out["report"]["steps"][0]["ok"])
+
+
+class MainTests(unittest.TestCase):
+    def main(self, argv, driver=None, plan=None, chooser=None, env=None):
+        driver = driver or FakeDriver()
+        patches = [mock.patch.dict(os.environ, dict(FAKE_KEYS, **(env or {}))),
+                   mock.patch.object(gui, "Driver", lambda binary: driver),
+                   mock.patch.object(gui, "jev_choose", chooser or pick("click:")),
+                   mock.patch.object(gui.sys, "platform", "darwin"),
+                   mock.patch.object(gui, "default_browser", lambda: "com.apple.safari"),
+                   mock.patch.object(gui.time, "sleep", lambda s: None),
+                   mock.patch.object(gui.subprocess, "run", FakeOpen())]
+        if plan is not None and gui.jev_plan is not None:
+            patches.append(mock.patch.object(gui.jev_plan, "plan", plan))
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(contextlib.redirect_stdout(out))
+            code = gui.main(argv)
+        return code, out.getvalue(), driver
+
+    @unittest.skipIf(gui.jev_plan is None, "jevkit.plan is not importable here")
+    def test_the_json_result_reports_plan_latency_and_each_step(self):
+        state = dict(STATE, window_title="Storage")
+        steps = [{"kind": "open_app", "target": "System Settings"}, {"kind": "press_key", "target": "escape"}]
+        code, printed, _ = self.main(["--plan", "--goal", "Open System Settings and press escape",
+                                      "--expect", "Storage", "--json"],
+                                     driver=FakeDriver(state=state), plan=planner(steps))
+        result = json.loads(printed.strip().splitlines()[-1])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["plan"]["latency_ms"], 812)
+        self.assertEqual(result["plan"]["status"], "planned")
+        self.assertEqual([(s["kind"], s["mode"], s["ok"]) for s in result["plan"]["steps"]],
+                         [("open_app", "direct", True), ("press_key", "direct", True)])
+        for record in result["plan"]["steps"]:
+            self.assertIsInstance(record["duration_ms"], int)
+
+    def test_without_the_flag_nothing_is_planned_and_the_result_is_the_old_shape(self):
+        called = []
+        code, printed, _ = self.main(["--pid", "30", "--window-id", "33", "--goal", "Open Storage",
+                                      "--max-steps", "1", "--json"],
+                                     plan=lambda *a, **k: called.append(a))
+        result = json.loads(printed.strip().splitlines()[-1])
+        self.assertEqual(called, [])
+        self.assertNotIn("plan", result)
+        self.assertEqual(sorted(result), sorted(["schema", "goal", "window_title", "steps", "elapsed_ms", "expected",
+                                                 "verified", "abstained", "regions_last", "actions"]))
+        self.assertEqual((code, result["steps"]), (4, 1))
+
+    def test_without_the_flag_pid_and_window_id_are_still_required(self):
+        with self.assertRaises(SystemExit) as stop, contextlib.redirect_stderr(io.StringIO()):
+            gui.main(["--goal", "Open Storage"])
+        self.assertEqual(stop.exception.code, 2)
+
+    def test_an_older_jevkit_without_a_planner_costs_the_speed_up_not_the_run(self):
+        """The installer vendors jevkit into the Hermes plugin, so a newer script can meet
+        an older jevkit. --plan must then run the goal as one loop, not refuse."""
+        with mock.patch.object(gui, "jev_plan", None):
+            code, printed, driver = self.main(["--plan", "--goal", "Open Storage", "--max-steps", "1", "--json"])
+        result = json.loads(printed.strip().splitlines()[-1])
+        self.assertEqual(len(driver.named("click")), 1)
+        self.assertNotIn("plan", result)
+        self.assertEqual(code, 4)
+
+
+class MissingDriverTests(unittest.TestCase):
+    """The docstring promises "exit 2 refused to start". A missing binary was a
+    FileNotFoundError traceback and exit 1, which a caller reads as a crash."""
+
+    def refused(self, binary):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, dict(FAKE_KEYS, CUA_DRIVER_BIN=binary)), contextlib.redirect_stdout(out):
+            code = gui.main(["--pid", "1", "--window-id", "1", "--goal", "Open the Library page"])
+        return code, out.getvalue()
+
+    def test_a_missing_driver_is_exit_2_with_one_line_and_no_traceback(self):
+        code, printed = self.refused(str(REPO / "no-such-dir" / "cua-driver"))
+        self.assertEqual(code, 2)
+        self.assertEqual(len(printed.strip().splitlines()), 1)
+        self.assertTrue(printed.startswith("FAIL: cannot start"))
+        self.assertIn("CUA_DRIVER_BIN", printed)
+
+    @unittest.skipUnless(shutil.which("true"), "needs a binary that exits without speaking MCP")
+    def test_a_binary_that_is_not_an_mcp_server_is_also_a_refusal(self):
+        """It starts, so Popen is happy, and then every call fails. That used to end as
+        "unverified", which blames the screen for a broken install."""
+        code, printed = self.refused(shutil.which("true"))
+        self.assertEqual(code, 2)
+        self.assertIn("did not answer the MCP handshake", printed)
+
+
+SELECTED_STATE = {"window_title": "", "elements": [
+    {"element_index": 1, "parent_index": 0, "role": "AXOutline"},
+    {"element_index": 2, "parent_index": 1, "role": "AXRow", "selected": True},
+    {"element_index": 3, "parent_index": 2, "role": "AXStaticText", "label": "General",
+     "element_token": "tok-general", "frame": {"x": 10, "y": 10, "w": 90, "h": 24}},
+    {"element_index": 4, "role": "AXButton", "label": "About", "element_token": "tok-about",
+     "frame": {"x": 200, "y": 10, "w": 90, "h": 24}},
+]}
+
+
+def torn(probabilities):
+    """Jev below the floor, as choose() reports it: reobserve plus the spread it saw."""
+    def choose(request):
+        choose.calls += 1
+        return {"selected_id": "reobserve", "confidence": max(probabilities.values()),
+                "reason": "low confidence", "probabilities": probabilities}
+    choose.calls = 0
+    return choose
+
+
+@unittest.skipIf(gui.jev_plan is None, "jevkit.plan is not importable here")
+class PlannedStepOutcomeTests(unittest.TestCase):
+    def test_a_step_whose_target_is_already_selected_is_finished_not_stalled(self):
+        """Recorded live: "go to General" with General already showing. Jev gave 0.66 to
+        clicking the selected row and 0.14 to `done`. Both are right, neither clears the
+        0.65 floor, and the plan stalled on a screen that was already correct."""
+        chooser = torn({"click:general": 0.66, "done": 0.14, "click:about": 0.05})
+        out, driver, _, _ = run_plan("Go to General", [{"kind": "click", "target": "General"}],
+                                     driver=FakeDriver(state=SELECTED_STATE), chooser=chooser,
+                                     pid=30, window_id=33)
+        self.assertTrue(out["report"]["steps"][0]["ok"])
+        self.assertEqual(chooser.calls, 1)
+        self.assertEqual(driver.named("click"), [])      # resolved by NOT acting, never by guessing a click
+
+    def test_low_confidence_about_an_unselected_target_is_still_not_acted_on(self):
+        """The floor exists because wrong answers live under it. Only "it is already
+        selected" may be resolved below it, and only into doing nothing."""
+        chooser = torn({"click:about": 0.60, "done": 0.20})
+        out, driver, _, _ = run_plan("Open About", [{"kind": "click", "target": "About"}],
+                                     driver=FakeDriver(state=SELECTED_STATE), chooser=chooser,
+                                     pid=30, window_id=33)
+        self.assertFalse(out["report"]["steps"][0]["ok"])
+        self.assertEqual(driver.named("click"), [])
+
+    def test_a_click_the_driver_refused_does_not_complete_the_step(self):
+        driver = FakeDriver(failing={"click": "click: element is not pressable"})
+        out, _, _, _ = run_plan("Open Storage", [{"kind": "click", "target": "Storage"}],
+                                driver=driver, chooser=pick("click:"), pid=30, window_id=33, max_steps=2)
+        self.assertFalse(out["report"]["steps"][0]["ok"])
+
+    def test_a_refusal_is_logged_with_its_reason(self):
+        """It was read from a field the driver never sets, so a refused click was logged as
+        {"effect": "refused", "message": ""} and the one line that said why was lost."""
+        refused = {"result": {"isError": True, "content": [{"type": "text", "text": "window_id does not belong to pid"}],
+                              "structuredContent": {"status": "refused"}}}
+        self.assertEqual(gui._brief(refused), {"effect": "refused", "message": "window_id does not belong to pid"})
+        self.assertEqual(gui._brief({"result": {"structuredContent": {"effect": "confirmed"}}}),
+                         {"effect": "confirmed", "message": ""})

@@ -13,6 +13,9 @@ Everything here degrades rather than fails. No Jev key: every turn is treated as
 background and the writer still gets a transcript. No writer model, or a writer that
 returns something that is not a capsule: the raw digest is kept instead, which is worse
 to read but loses nothing.
+
+Confidentiality is the one exception. Where a capsule may not carry customer detail and
+the pieces that guarantee that are missing, nothing is written and the status says why.
 """
 from __future__ import annotations
 
@@ -28,11 +31,23 @@ from typing import Any, Dict, List, Mapping, Optional
 TRIGGERS = frozenset({"handoff", "hand off", "hand-off"})
 TRANSCRIPT_CHARS = 24_000
 CAPSULE_MAX_CHARS = 6_000
-EXPORT_TIMEOUT = 120
-WRITER_TIMEOUT = 300
+# An 800-message session exports in about half a second. Thirty seconds is a wedged CLI,
+# not a slow one, and nothing should wait two minutes to find that out.
+EXPORT_TIMEOUT = 30
 
 
 def home() -> Path:
+    # A gateway that serves several profiles from one process scopes each turn to a
+    # profile with a context-local override and leaves HERMES_HOME pointing at the root.
+    # Reading only the variable there looks for the session in the wrong database, finds
+    # nothing, and reports a long conversation as too short to hand off.
+    try:
+        from hermes_constants import get_hermes_home_override  # type: ignore
+        override = get_hermes_home_override()
+        if override:
+            return Path(override)
+    except Exception:  # noqa: BLE001 - not running inside Hermes, or an older one
+        pass
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
@@ -92,6 +107,46 @@ def lane_from_session(session_id: str, *, state_db: Optional[Path] = None) -> Op
     return _clean(key) if key else None
 
 
+def open_session_for(context: Mapping[str, Any], *, state_db: Optional[Path] = None) -> Optional[str]:
+    """The newest open session for a conversation, read from the session store's database.
+
+    The gateway's own key-to-session mapping is the authority and the plugin asks that
+    first. This is what is left when a host renames those methods: a conversation can
+    have several rows that were never marked ended, and the one still in use is the one
+    started last.
+    """
+    chat = str(context.get("chat_id") or "")
+    if not chat:
+        return None
+    db = state_db or (home() / "state.db")
+    if not db.is_file():
+        return None
+    try:
+        import sqlite3
+        # One second, not the usual ten: this runs on the gateway's dispatch path, and a
+        # locked database must cost the person a missing capsule, not a frozen chat.
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+        try:
+            columns = {r[1] for r in conn.execute("pragma table_info(sessions)")}
+            if not {"id", "chat_id", "ended_at", "started_at"} <= columns:
+                return None
+            where, values = ["chat_id=?", "ended_at is null"], [chat]
+            platform = str(context.get("platform") or context.get("source") or "")
+            if platform and "source" in columns:
+                where.append("source=?")
+                values.append(platform)
+            if "thread_id" in columns:
+                where.append("coalesce(thread_id, '')=?")
+                values.append(str(context.get("thread_id") or ""))
+            row = conn.execute(f"select id from sessions where {' and '.join(where)} "
+                               "order by started_at desc limit 1", values).fetchone()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
 def lane_key(context: Mapping[str, Any]) -> str:
     """Stable per-conversation key. One capsule per conversation, not per session id."""
     # `platform` is what the hooks call it; `source` is what the session store calls it.
@@ -128,7 +183,9 @@ def confidential_here() -> bool:
     if str(os.environ.get("HANDOFF_CONFIDENTIAL", "")).strip().lower() in ("1", "true", "yes", "on"):
         return True
     try:
-        return (handoff_dir() / CONFIDENTIAL_MARKER).exists()
+        # Not handoff_dir(): that creates the directory, and the nightly script asks this
+        # question during --dry-run, which promises to touch nothing.
+        return (home() / "handoffs" / CONFIDENTIAL_MARKER).exists()
     except OSError:
         return False
 
@@ -181,9 +238,12 @@ def export_messages(session_id: str, *, runner: Optional[Any] = None) -> List[Di
     """
     run = runner or subprocess.run
     try:
+        # The child only sees the environment, so the home this process resolved (which
+        # may come from a per-turn override, see home()) has to be handed to it by name.
         done = run(_hermes_bin() + ["sessions", "export", "--session-id", str(session_id),
                                     "--format", "jsonl", "-"],
-                   capture_output=True, text=True, timeout=EXPORT_TIMEOUT)
+                   capture_output=True, text=True, timeout=EXPORT_TIMEOUT,
+                   env={**os.environ, "HERMES_HOME": str(home())})
     except Exception:  # noqa: BLE001 - a handoff must never take the session down with it
         return []
     if getattr(done, "returncode", 1) != 0:
@@ -245,6 +305,20 @@ def extract_text(response: Any) -> str:
 
 # ── writing the capsule ──────────────────────────────────────────────────────
 
+# Only reached when a caller asks for confidentiality and supplies no prompt builder.
+# jevkit's handoff_prompt(confidential=True) is the real rule and is what every shipped
+# caller uses; this exists so that path can never mean "the writer was told nothing".
+_CONFIDENTIAL_FALLBACK_PROMPT = (
+    "Write a handoff breadcrumb for the work in the transcript below, under these headings: "
+    "## Working on, ## State, ## Next. Record only the task, what is still missing, who must "
+    "approve it, and the next safe action. Never carry a person's name, an email address, a "
+    "phone number, a street address, a document or file name, a link, an account or invoice "
+    "number, or any payment or health detail; write \"the customer\" or \"the staff member\" "
+    "instead. If a section would have nothing left, write \"nothing recorded\".\n\n"
+    "TRANSCRIPT:\n\n"
+)
+
+
 def build(
     session_id: str, lane: str, *, write: Any, select: Any = None, digest: Any = None,
     prompt_for: Any = None, valid: Any = None, runner: Optional[Any] = None,
@@ -255,18 +329,30 @@ def build(
     The jevkit callables are injected so this module stays importable, and testable,
     on a machine with no Jev key and no network.
     """
+    if confidential and scrub is None:
+        # No scrubber means no jevkit, which means no confidential prompt and no validator
+        # either: the writer's free text about a customer would go to disk unchecked.
+        # Decided before the export so a refusal costs nothing and reads nothing.
+        return {"status": "confidential_unsupported", "reason": "no_scrub"}
+
     messages = export_messages(session_id, runner=runner)
     if len(messages) < 4:
         return {"status": "too_short", "messages": len(messages)}
 
-    jev_calls, counts = 0, {}
+    # `jev` travels with the result because status "ok" only means a capsule was written.
+    # A Jev outage still writes one, from an unfiltered transcript, and whoever reads the
+    # report has to be able to tell that night from a good one.
+    jev_calls, counts, jev, jev_errors = 0, {}, "not_used", []
     if select and digest:
         try:
             selection = select(messages, keep_last=8)
             counts = selection.get("counts") or {}
             jev_calls = selection.get("jev_calls") or 0
+            jev = str(selection.get("status") or "ok")
+            jev_errors = list(selection.get("errors") or [])
             body = digest(messages, selection, TRANSCRIPT_CHARS)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            jev, jev_errors = "error", [type(error).__name__]
             body = _plain(messages)
     else:
         body = _plain(messages)
@@ -285,11 +371,18 @@ def build(
             try:
                 prompt = prompt_for(body, previous, confidential=confidential)
             except TypeError:
-                # An older jevkit has no confidentiality mode. Fall back rather than
-                # fail — but a caller that asked for it must not silently not get it.
-                if confidential and scrub is None:
-                    return {"status": "confidential_unsupported"}
+                # An older jevkit has no confidentiality mode. This used to carry on when a
+                # scrubber was supplied and still report "ok", on the theory that the regex
+                # layer was enough. It is not: a regex removes a phone number and leaves
+                # "Jane Doe wants the quote revised" exactly as written. Only the
+                # prompt can keep a name out, so without it there is no capsule.
+                if confidential:
+                    return {"status": "confidential_unsupported", "reason": "prompt_has_no_confidential_mode"}
                 prompt = prompt_for(body, previous)
+        elif confidential:
+            # No prompt builder at all. Handing the writer a bare transcript would leave
+            # the scrubber as the only control, which is the same downgrade by another door.
+            prompt = _CONFIDENTIAL_FALLBACK_PROMPT + body
         else:
             prompt = body
         capsule = (write(prompt) or "").strip()
@@ -330,7 +423,8 @@ def build(
     except OSError as error:
         return {"status": "write_failed", "error": str(error)[:200]}
     return {"status": "ok", "lane": lane, "path": str(capsule_path(lane)), "messages": len(messages),
-            "jev_calls": jev_calls, "counts": counts, "chars": len(text)}
+            "jev": jev, "jev_errors": jev_errors, "jev_calls": jev_calls, "counts": counts,
+            "chars": len(text)}
 
 
 def _plain(messages: List[Dict[str, str]]) -> str:
@@ -340,13 +434,24 @@ def _plain(messages: List[Dict[str, str]]) -> str:
 
 # ── handing it to the next session ───────────────────────────────────────────
 
-def take_pending(lane: str, *, max_age_s: float = 36 * 3600) -> Optional[str]:
-    """The capsule for a lane's next turn, consumed once so it is not injected forever."""
+def take_pending(lane: str, *, max_age_s: float = 36 * 3600, current_session: str = "") -> Optional[str]:
+    """The capsule for a lane's next session, consumed once so it is not injected forever.
+
+    ``current_session`` is the session asking. A capsule is for the session AFTER the one
+    it summarises. Writing one no longer ends the turn, so the session that was just
+    summarised is usually still the one talking when the capsule lands; handing it over
+    there would feed a conversation its own summary and leave nothing for the fresh
+    session the person opens next.
+    """
     marker = pending_path(lane)
     if not marker.exists():
         return None
     try:
         info = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(info, dict):
+            raise ValueError("pending marker is not an object")
+        if current_session and str(info.get("session_id") or "") == str(current_session):
+            return None
         if time.time() - float(info.get("at") or 0) > max_age_s:
             marker.unlink(missing_ok=True)
             return None
